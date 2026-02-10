@@ -46,52 +46,33 @@ export default function App() {
     }
   };
 
+  const connectSection = (
+    <section>
+      <button
+        onClick={handleConnect}
+        style={{ padding: '8px 16px', borderRadius: 6, border: 'none', background: '#22c55e', color: '#fff', fontWeight: 500 }}
+      >
+        {connected ? 'Reconnect to node' : 'Connect to node'}
+      </button>
+      {connectionError && (
+        <p style={{ color: '#f87171', marginTop: 8 }}>{connectionError}</p>
+      )}
+      <Whitepaper />
+    </section>
+  );
+
   return (
     <div style={{ padding: 24, maxWidth: 900, margin: '0 auto' }}>
       <h1 style={{ marginTop: 0, fontWeight: 600 }}>Pulse Simulator</h1>
 
       {!connected ? (
-        <section>
-          <h2>Connect to node</h2>
-          <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
-            <input
-              type="url"
-              value={nodeUrl}
-              onChange={(e) => setNodeUrl(e.target.value)}
-              placeholder="http://localhost:8080"
-              style={{
-                padding: '8px 12px',
-                width: 320,
-                borderRadius: 6,
-                border: '1px solid #3f3f46',
-                background: '#18181b',
-                color: '#e4e4e7',
-              }}
-            />
-            <button
-              onClick={handleConnect}
-              style={{
-                padding: '8px 16px',
-                borderRadius: 6,
-                border: 'none',
-                background: '#22c55e',
-                color: '#fff',
-                fontWeight: 500,
-              }}
-            >
-              Connect
-            </button>
-          </div>
-          {connectionError && (
-            <p style={{ color: '#f87171', marginTop: 8 }}>{connectionError}</p>
-          )}
-        </section>
+        connectSection
       ) : (
         <>
           <nav style={{ display: 'flex', gap: 16, marginBottom: 24, flexWrap: 'wrap' }}>
             <button
               onClick={() => setPage('connect')}
-              style={{ padding: '6px 12px', borderRadius: 6, border: '1px solid #3f3f46', background: '#18181b', color: '#e4e4e7' }}
+              style={{ padding: '6px 12px', borderRadius: 6, border: '1px solid #3f3f46', background: page === 'connect' ? '#3f3f46' : '#18181b', color: '#e4e4e7' }}
             >
               Reconnect to node
             </button>
@@ -115,19 +96,104 @@ export default function App() {
             </button>
           </nav>
 
-          {page === 'connect' && (
-            <section>
-              <button onClick={handleConnect} style={{ padding: '8px 16px', borderRadius: 6, border: 'none', background: '#22c55e', color: '#fff', fontWeight: 500 }}>
-                Reconnect to node
-              </button>
-            </section>
-          )}
-
+          {page === 'connect' && connectSection}
           {page === 'dashboard' && <Dashboard nodeUrl={nodeUrl} />}
           {page === 'chain' && <ChainView nodeUrl={nodeUrl} />}
           {page === 'accounts' && <Accounts nodeUrl={nodeUrl} />}
         </>
       )}
+    </div>
+  );
+}
+
+function Whitepaper() {
+  const sectionStyle = { marginTop: 24, marginBottom: 16 };
+  const headingStyle = { fontSize: 16, color: '#e4e4e7', marginBottom: 8 };
+  const subStyle = { fontSize: 14, color: '#a1a1aa', marginBottom: 6 };
+  const pStyle = { margin: '0 0 12px 0', fontSize: 13, lineHeight: 1.6, color: '#d4d4d8' };
+  const codeStyle = { fontFamily: 'monospace', fontSize: 12, background: '#27272a', padding: '2px 6px', borderRadius: 4, color: '#a1a1aa' };
+  const ulStyle = { margin: '0 0 12px 0', paddingLeft: 20, fontSize: 13, lineHeight: 1.6, color: '#d4d4d8' };
+  return (
+    <div style={{ marginTop: 32, maxHeight: '60vh', overflowY: 'auto', paddingRight: 8 }}>
+      <h3 style={{ margin: '0 0 8px 0', fontSize: 18, color: '#e4e4e7' }}>Pulse Network Whitepaper</h3>
+      <p style={{ ...pStyle, color: '#a1a1aa', fontStyle: 'italic' }}>
+        A Living Consensus System for a Global Human-Backed Economy
+      </p>
+
+      <div style={sectionStyle}>
+        <h4 style={headingStyle}>Abstract</h4>
+        <p style={pStyle}>
+          We propose a decentralized, biologically-anchored system for global transactions, identity verification, and social activity. Unlike traditional blockchains (Proof-of-Work or Proof-of-Stake), the Pulse Network uses <strong>Proof-of-Life (PoL)</strong> as its core consensus engine. Each human contributes verified biometric signals — primarily heartbeat data — to validate transactions, secure the network, and generate a currency tied to human presence. This offers a global economy, real-time activity measurement, and a verifiable ledger of human engagement.
+        </p>
+      </div>
+
+      <div style={sectionStyle}>
+        <h4 style={headingStyle}>1. Introduction</h4>
+        <p style={pStyle}>
+          Current monetary and consensus systems depend on centralized control or artificial scarcity (hashing power, financial stake). The Pulse Network introduces <strong>biological scarcity</strong>: the inability to forge human life. By anchoring validity to live heartbeat data, the network establishes a global, trustless economic ecosystem where every transaction and block is backed by living human participants.
+        </p>
+      </div>
+
+      <div style={sectionStyle}>
+        <h4 style={headingStyle}>2. System Architecture</h4>
+        <p style={subStyle}>2.1 Device Layer</p>
+        <p style={pStyle}>
+          Each participant uses a device that captures heart rate (HR), motion (x,y,z), temperature, and optional biometrics. Each heartbeat packet is cryptographically signed so the network can verify authenticity and prevent replay attacks.
+        </p>
+        <p style={subStyle}>2.2 Node Layer</p>
+        <p style={pStyle}>
+          Nodes validate and propagate heartbeat signals. They verify signatures and timestamps, maintain a mempool of pulse-backed transactions, and aggregate verified heartbeats and transactions into Pulse Blocks. Transactions without a valid, current heartbeat signature are invalid.
+        </p>
+        <p style={subStyle}>2.3 Pulse Block &amp; Consensus</p>
+        <p style={pStyle}>
+          A Pulse Block contains verified heartbeats, transactions, previous block hash, and timestamp. Consensus is achieved when a minimum number of verified human participants contribute heartbeats in a block interval. Block accepted if <span style={codeStyle}>N_live ≥ N_threshold</span>. Optional weighting: contribution W_i = α·HR_i + β·‖M_i‖ + γ·Δt_i so that activity and continuity increase influence.
+        </p>
+      </div>
+
+      <div style={sectionStyle}>
+        <h4 style={headingStyle}>3. Reward Distribution &amp; Token Economics</h4>
+        <p style={pStyle}>
+          Each verified heartbeat earns Pulse tokens. Reward for participant i is proportional to weighted contribution: <span style={codeStyle}>R_i = (W_i / Σ W_j) · R_total</span>. Supply grows with human participation but is biologically constrained — no synthetic or bot-driven inflation. Inflation π(t) is naturally bounded by block interval and total supply; velocity of money V = Σ TX / T_supply reflects human-backed liquidity.
+        </p>
+      </div>
+
+      <div style={sectionStyle}>
+        <h4 style={headingStyle}>4. Security</h4>
+        <ul style={ulStyle}>
+          <li><strong>Sybil resistance:</strong> Life cannot be forged; synthetic nodes cannot produce valid heartbeats.</li>
+          <li><strong>Replay prevention:</strong> Timestamp and continuity validation reject old or replayed data.</li>
+          <li><strong>Fork resolution:</strong> Competing blocks are resolved by cumulative verified life (heaviest chain wins).</li>
+          <li><strong>Fork probability:</strong> P_fork = e^(-k·S) — security S is sum of weighted lives; more participants → negligible fork risk.</li>
+        </ul>
+      </div>
+
+      <div style={sectionStyle}>
+        <h4 style={headingStyle}>5. Data Flow (End-to-End)</h4>
+        <p style={pStyle}>
+          (1) Device captures and signs heartbeat → (2) Broadcast to nodes; nodes verify signature and freshness → (3) Transactions collected with pulse signatures → (4) Node assembles Pulse Block (heartbeats + transactions) → (5) Proof-of-Life check: minimum live threshold met → (6) Block committed to chain, state updated → (7) Block broadcast to peers → (8) Rewards distributed to live participants → (9) Persistent, immutable ledger of verified human presence and activity.
+        </p>
+      </div>
+
+      <div style={sectionStyle}>
+        <h4 style={headingStyle}>6. Applications</h4>
+        <p style={pStyle}>
+          Global economic layer (life-backed currency, micro-payments); identity and reputation verification; gaming and social (activity points, anti-bot); aggregated anonymized health metrics. The ledger is a foundation for Web4 applications where living humans are the source of truth.
+        </p>
+      </div>
+
+      <div style={sectionStyle}>
+        <h4 style={headingStyle}>7. Quantitative Properties (Summary)</h4>
+        <p style={pStyle}>
+          Reward per human scales with activity; block security S = Σ W_i; TPS scales with population (λ · N_live); inflation is human-constrained; biometric variability provides entropy for randomness. At scale, the network achieves high throughput and sub-minute finality with negligible fork probability.
+        </p>
+      </div>
+
+      <div style={sectionStyle}>
+        <h4 style={headingStyle}>Conclusion</h4>
+        <p style={pStyle}>
+          The Pulse Network replaces energy-intensive or stake-based consensus with a biologically anchored, human-verified ledger. By tying currency and security to actual human life, it establishes a globally resilient economic layer, a new method for identity verification, and a foundation for the next generation of human-centric applications.
+        </p>
+      </div>
     </div>
   );
 }
