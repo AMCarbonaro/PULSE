@@ -1,0 +1,37 @@
+# Dependencies
+node_modules/
+
+# Build / release
+app/dist/
+app/release/
+node/target/
+**/target/
+
+# Terraform
+infrastructure/.terraform/
+infrastructure/*.tfstate
+infrastructure/*.tfstate.*
+infrastructure/.terraform.lock.hcl
+infrastructure/tfplan
+
+# Secrets / keys (do not commit)
+*.pem
+infrastructure/pulse-key.pem
+
+# OS / IDE
+.DS_Store
+*.log
+.idea/
+.vscode/
+*.swp
+*~
+
+# Env / venv
+venv/
+.env
+.env.*
+
+# Device SDK build / checkouts
+device-sdk/ios/.build/
+device-sdk/**/.build/
+**/checkouts/
