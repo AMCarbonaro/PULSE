@@ -4,7 +4,7 @@ import { generateKeypair, sign, heartbeatSignablePayload, transactionSignablePay
 import { loadAccounts, addAccount, removeAccount, type StoredAccount } from './storage';
 
 const NODE_URL_KEY = 'pulse-node-url';
-const DEFAULT_NODE_URL = 'http://18.117.9.159:8080';
+const DEFAULT_NODE_URL = 'https://topics-besides-index-portsmouth.trycloudflare.com';
 
 type Page = 'connect' | 'dashboard' | 'chain' | 'accounts' | 'simulate';
 
