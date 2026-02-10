@@ -3,7 +3,7 @@ import { health, getStats, getChain, getLatestBlock, getBlocks, getBalance, getA
 import { generateKeypair, sign, heartbeatSignablePayload, transactionSignablePayload } from './crypto';
 import { loadAccounts, addAccount, removeAccount, type StoredAccount } from './storage';
 
-const NODE_URL = 'https://topics-besides-index-portsmouth.trycloudflare.com';
+const NODE_URL = 'https://brand-mistress-calvin-jacob.trycloudflare.com';
 
 type Page = 'dashboard' | 'chain' | 'accounts' | 'whitepaper';
 
