@@ -1,5 +1,5 @@
 {
-  "name": "pulse-simulator",
+  "name": "pulse-network",
   "version": "0.1.0",
   "description": "Pulse Network simulation desktop app",
   "main": "electron/main.js",
@@ -11,8 +11,8 @@
     "electron:build": "vite build && electron-builder"
   },
   "build": {
-    "appId": "com.pulse.simulator",
-    "productName": "Pulse Simulator",
+    "appId": "com.pulse.network",
+    "productName": "Pulse Network",
     "directories": {
       "output": "release"
     },
