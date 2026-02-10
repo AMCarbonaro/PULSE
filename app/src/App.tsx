@@ -19,7 +19,6 @@ export default function App() {
   const [connected, setConnected] = useState(false);
   const [page, setPage] = useState<Page>('connect');
   const [connectionError, setConnectionError] = useState<string | null>(null);
-  const [lastHeartbeatByPubkey, setLastHeartbeatByPubkey] = useState<Record<string, string>>({});
 
   const saveNodeUrl = (url: string) => {
     setNodeUrl(url);
@@ -31,6 +30,14 @@ export default function App() {
   const handleConnect = async () => {
     setConnectionError(null);
     const base = nodeUrl.replace(/\/$/, '');
+    const isHttpsPage = typeof window !== 'undefined' && window.location?.protocol === 'https:';
+    const isHttpNode = base.toLowerCase().startsWith('http://');
+    if (isHttpsPage && isHttpNode) {
+      setConnectionError(
+        'Browsers block HTTP when the app is on HTTPS. Use an HTTPS URL for your node (e.g. reverse proxy with SSL), or run the app from http://localhost.'
+      );
+      return;
+    }
     try {
       const res = await fetch(`${base}/health`, { signal: AbortSignal.timeout(5000) });
       const data = await res.json();
@@ -42,12 +49,45 @@ export default function App() {
         setConnectionError('Node did not return success');
       }
     } catch (e) {
-      setConnectionError(e instanceof Error ? e.message : 'Connection failed');
+      const msg = e instanceof Error ? e.message : 'Connection failed';
+      setConnectionError(
+        msg.includes('fetch') || msg.includes('Load failed')
+          ? `${msg} — If the app is on HTTPS (Netlify), the node must be reachable over HTTPS.`
+          : msg
+      );
     }
   };
 
+  const isHttpsPage = typeof window !== 'undefined' && window.location?.protocol === 'https:';
   const connectSection = (
     <section>
+      <div style={{ marginBottom: 16 }}>
+        <label style={{ display: 'block', fontSize: 14, color: '#a1a1aa', marginBottom: 6 }}>
+          Node URL {isHttpsPage && '(must be https:// when using this app on Netlify)'}
+        </label>
+        <input
+          type="url"
+          value={nodeUrl}
+          onChange={(e) => {
+            const v = e.target.value.trim();
+            setNodeUrl(v);
+            if (v) try { localStorage.setItem(NODE_URL_KEY, v); } catch {}
+          }}
+          placeholder="https://your-node.example.com or http://localhost:8080"
+          style={{
+            display: 'block',
+            width: '100%',
+            maxWidth: 420,
+            padding: '8px 12px',
+            borderRadius: 6,
+            border: '1px solid #3f3f46',
+            background: '#18181b',
+            color: '#e4e4e7',
+            fontFamily: 'monospace',
+            fontSize: 13,
+          }}
+        />
+      </div>
       <button
         onClick={handleConnect}
         style={{ padding: '8px 16px', borderRadius: 6, border: 'none', background: '#22c55e', color: '#fff', fontWeight: 500 }}

@@ -28,12 +28,32 @@ Pulse/
 
 ## Quick Start
 
-### Run the Node
+### Run locally (node + web app)
+
+**Terminal 1 – node:**
 
 ```bash
 cd node
 cargo build --release
-./target/release/pulse-node --simulate
+./target/release/pulse-node --simulate --port 8080
+```
+
+**Terminal 2 – frontend:**
+
+```bash
+cd app
+npm install
+npm run dev
+```
+
+Open **http://localhost:5173**, set Node URL to `http://localhost:8080`, and click Connect.
+
+### Run the Node only
+
+```bash
+cd node
+cargo build --release
+./target/release/pulse-node --simulate --port 8080
 ```
 
 ### API Endpoints

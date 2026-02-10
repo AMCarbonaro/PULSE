@@ -4,6 +4,8 @@ Use this when you need to restart the node (e.g. after deploying the new binary 
 
 **SSH target / frontend node URL:** `18.117.9.159` (API on port 8080)
 
+**To use the app on Netlify (HTTPS)** you need the node on HTTPS too. See **[HTTPS-NODE-CLOUDFLARE.md](./HTTPS-NODE-CLOUDFLARE.md)** for exposing the node with a Cloudflare Tunnel.
+
 ---
 
 ## 1. SSH into the instance
