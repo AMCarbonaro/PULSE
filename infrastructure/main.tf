@@ -217,6 +217,12 @@ resource "aws_iam_role_policy" "s3_artifacts" {
   })
 }
 
+# SSM policy for remote management
+resource "aws_iam_role_policy_attachment" "ssm_managed" {
+  role       = aws_iam_role.node_role.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+}
+
 # Instance profile
 resource "aws_iam_instance_profile" "node_profile" {
   name = "${var.project_name}-node-profile"
@@ -274,6 +280,28 @@ resource "aws_sns_topic_subscription" "email" {
   topic_arn = aws_sns_topic.alerts[0].arn
   protocol  = "email"
   endpoint  = var.alert_email
+}
+
+# ==================== CloudWatch Alarms ====================
+
+# Alarm: EC2 instance status check failed
+resource "aws_cloudwatch_metric_alarm" "node_status" {
+  alarm_name          = "${var.project_name}-node-status"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 2
+  metric_name         = "StatusCheckFailed"
+  namespace           = "AWS/EC2"
+  period              = 60
+  statistic           = "Maximum"
+  threshold           = 0
+  alarm_description   = "Pulse node EC2 instance status check failed"
+  
+  dimensions = {
+    InstanceId = aws_instance.genesis_node.id
+  }
+
+  alarm_actions = var.alert_email != "" ? [aws_sns_topic.alerts[0].arn] : []
+  ok_actions    = var.alert_email != "" ? [aws_sns_topic.alerts[0].arn] : []
 }
 
 # ==================== EC2 Instance ====================
