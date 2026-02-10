@@ -3,145 +3,89 @@ import { health, getStats, getChain, getLatestBlock, getBlocks, getBalance, getA
 import { generateKeypair, sign, heartbeatSignablePayload, transactionSignablePayload } from './crypto';
 import { loadAccounts, addAccount, removeAccount, type StoredAccount } from './storage';
 
-const NODE_URL_KEY = 'pulse-node-url';
-const DEFAULT_NODE_URL = 'https://topics-besides-index-portsmouth.trycloudflare.com';
+const NODE_URL = 'https://topics-besides-index-portsmouth.trycloudflare.com';
 
-type Page = 'connect' | 'dashboard' | 'chain' | 'accounts' | 'simulate';
+type Page = 'dashboard' | 'chain' | 'accounts';
 
 export default function App() {
-  const [nodeUrl, setNodeUrl] = useState(() => {
-    try {
-      return localStorage.getItem(NODE_URL_KEY) || DEFAULT_NODE_URL;
-    } catch {
-      return DEFAULT_NODE_URL;
-    }
-  });
   const [connected, setConnected] = useState(false);
-  const [page, setPage] = useState<Page>('connect');
+  const [page, setPage] = useState<Page>('dashboard');
   const [connectionError, setConnectionError] = useState<string | null>(null);
+  const [connecting, setConnecting] = useState(true);
 
-  const saveNodeUrl = (url: string) => {
-    setNodeUrl(url);
-    try {
-      localStorage.setItem(NODE_URL_KEY, url);
-    } catch {}
-  };
-
-  const handleConnect = async () => {
-    setConnectionError(null);
-    const base = nodeUrl.replace(/\/$/, '');
-    const isHttpsPage = typeof window !== 'undefined' && window.location?.protocol === 'https:';
-    const isHttpNode = base.toLowerCase().startsWith('http://');
-    if (isHttpsPage && isHttpNode) {
-      setConnectionError(
-        'Browsers block HTTP when the app is on HTTPS. Use an HTTPS URL for your node (e.g. reverse proxy with SSL), or run the app from http://localhost.'
-      );
-      return;
-    }
-    try {
-      const res = await fetch(`${base}/health`, { signal: AbortSignal.timeout(5000) });
-      const data = await res.json();
-      if (res.ok && data.success) {
-        saveNodeUrl(base);
-        setConnected(true);
-        setPage('dashboard');
-      } else {
-        setConnectionError('Node did not return success');
+  useEffect(() => {
+    // Auto-connect on load
+    (async () => {
+      try {
+        const res = await fetch(`${NODE_URL}/health`, { signal: AbortSignal.timeout(5000) });
+        const data = await res.json();
+        if (res.ok && data.success) {
+          setConnected(true);
+        } else {
+          setConnectionError('Node did not return success');
+        }
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : 'Connection failed';
+        setConnectionError(msg);
+      } finally {
+        setConnecting(false);
       }
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : 'Connection failed';
-      setConnectionError(
-        msg.includes('fetch') || msg.includes('Load failed')
-          ? `${msg} — If the app is on HTTPS (Netlify), the node must be reachable over HTTPS.`
-          : msg
-      );
-    }
-  };
+    })();
+  }, []);
 
-  const isHttpsPage = typeof window !== 'undefined' && window.location?.protocol === 'https:';
-  const connectSection = (
-    <section>
-      <div style={{ marginBottom: 16 }}>
-        <label style={{ display: 'block', fontSize: 14, color: '#a1a1aa', marginBottom: 6 }}>
-          Node URL {isHttpsPage && '(must be https:// when using this app on Netlify)'}
-        </label>
-        <input
-          type="url"
-          value={nodeUrl}
-          onChange={(e) => {
-            const v = e.target.value.trim();
-            setNodeUrl(v);
-            if (v) try { localStorage.setItem(NODE_URL_KEY, v); } catch {}
-          }}
-          placeholder="https://your-node.example.com or http://localhost:8080"
-          style={{
-            display: 'block',
-            width: '100%',
-            maxWidth: 420,
-            padding: '8px 12px',
-            borderRadius: 6,
-            border: '1px solid #3f3f46',
-            background: '#18181b',
-            color: '#e4e4e7',
-            fontFamily: 'monospace',
-            fontSize: 13,
-          }}
-        />
+  if (connecting) {
+    return (
+      <div style={{ padding: 24, maxWidth: 900, margin: '0 auto' }}>
+        <h1 style={{ marginTop: 0, fontWeight: 600 }}>Pulse Network</h1>
+        <p style={{ color: '#a1a1aa' }}>Connecting to node…</p>
       </div>
-      <button
-        onClick={handleConnect}
-        style={{ padding: '8px 16px', borderRadius: 6, border: 'none', background: '#22c55e', color: '#fff', fontWeight: 500 }}
-      >
-        {connected ? 'Reconnect to node' : 'Connect to node'}
-      </button>
-      {connectionError && (
-        <p style={{ color: '#f87171', marginTop: 8 }}>{connectionError}</p>
-      )}
-      <Whitepaper />
-    </section>
-  );
+    );
+  }
+
+  if (!connected) {
+    return (
+      <div style={{ padding: 24, maxWidth: 900, margin: '0 auto' }}>
+        <h1 style={{ marginTop: 0, fontWeight: 600 }}>Pulse Network</h1>
+        <p style={{ color: '#f87171' }}>Failed to connect to node: {connectionError}</p>
+        <button
+          onClick={() => window.location.reload()}
+          style={{ padding: '8px 16px', borderRadius: 6, border: 'none', background: '#22c55e', color: '#fff', fontWeight: 500 }}
+        >
+          Retry
+        </button>
+        <Whitepaper />
+      </div>
+    );
+  }
 
   return (
     <div style={{ padding: 24, maxWidth: 900, margin: '0 auto' }}>
-      <h1 style={{ marginTop: 0, fontWeight: 600 }}>Pulse Simulator</h1>
+      <h1 style={{ marginTop: 0, fontWeight: 600 }}>Pulse Network</h1>
 
-      {!connected ? (
-        connectSection
-      ) : (
-        <>
-          <nav style={{ display: 'flex', gap: 16, marginBottom: 24, flexWrap: 'wrap' }}>
-            <button
-              onClick={() => setPage('connect')}
-              style={{ padding: '6px 12px', borderRadius: 6, border: '1px solid #3f3f46', background: page === 'connect' ? '#3f3f46' : '#18181b', color: '#e4e4e7' }}
-            >
-              Reconnect to node
-            </button>
-            <button
-              onClick={() => setPage('dashboard')}
-              style={{ padding: '6px 12px', borderRadius: 6, border: '1px solid #3f3f46', background: page === 'dashboard' ? '#3f3f46' : '#18181b', color: '#e4e4e7' }}
-            >
-              Dashboard
-            </button>
-            <button
-              onClick={() => setPage('chain')}
-              style={{ padding: '6px 12px', borderRadius: 6, border: '1px solid #3f3f46', background: page === 'chain' ? '#3f3f46' : '#18181b', color: '#e4e4e7' }}
-            >
-              Chain
-            </button>
-            <button
-              onClick={() => setPage('accounts')}
-              style={{ padding: '6px 12px', borderRadius: 6, border: '1px solid #3f3f46', background: page === 'accounts' ? '#3f3f46' : '#18181b', color: '#e4e4e7' }}
-            >
-              Accounts
-            </button>
-          </nav>
+      <nav style={{ display: 'flex', gap: 16, marginBottom: 24, flexWrap: 'wrap' }}>
+        <button
+          onClick={() => setPage('dashboard')}
+          style={{ padding: '6px 12px', borderRadius: 6, border: '1px solid #3f3f46', background: page === 'dashboard' ? '#3f3f46' : '#18181b', color: '#e4e4e7' }}
+        >
+          Dashboard
+        </button>
+        <button
+          onClick={() => setPage('chain')}
+          style={{ padding: '6px 12px', borderRadius: 6, border: '1px solid #3f3f46', background: page === 'chain' ? '#3f3f46' : '#18181b', color: '#e4e4e7' }}
+        >
+          Chain
+        </button>
+        <button
+          onClick={() => setPage('accounts')}
+          style={{ padding: '6px 12px', borderRadius: 6, border: '1px solid #3f3f46', background: page === 'accounts' ? '#3f3f46' : '#18181b', color: '#e4e4e7' }}
+        >
+          Accounts
+        </button>
+      </nav>
 
-          {page === 'connect' && connectSection}
-          {page === 'dashboard' && <Dashboard nodeUrl={nodeUrl} />}
-          {page === 'chain' && <ChainView nodeUrl={nodeUrl} />}
-          {page === 'accounts' && <Accounts nodeUrl={nodeUrl} />}
-        </>
-      )}
+      {page === 'dashboard' && <Dashboard nodeUrl={NODE_URL} />}
+      {page === 'chain' && <ChainView nodeUrl={NODE_URL} />}
+      {page === 'accounts' && <Accounts nodeUrl={NODE_URL} />}
     </div>
   );
 }
@@ -558,205 +502,5 @@ function Accounts({ nodeUrl }: { nodeUrl: string }) {
         )}
       </div>
     </section>
-  );
-}
-
-function Simulate({
-  nodeUrl,
-  lastHeartbeatByPubkey,
-  setLastHeartbeatByPubkey,
-}: {
-  nodeUrl: string;
-  lastHeartbeatByPubkey: Record<string, string>;
-  setLastHeartbeatByPubkey: React.Dispatch<React.SetStateAction<Record<string, string>>>;
-}) {
-  const accounts = loadAccounts();
-  const [heartbeatAccount, setHeartbeatAccount] = useState('');
-  const [heartRate, setHeartRate] = useState(72);
-  const [motionX, setMotionX] = useState(0.1);
-  const [motionY, setMotionY] = useState(0.1);
-  const [motionZ, setMotionZ] = useState(0.05);
-  const [temp, setTemp] = useState(36.6);
-  const [heartbeatStatus, setHeartbeatStatus] = useState<'idle' | 'sending' | 'ok' | 'err'>('idle');
-  const [heartbeatError, setHeartbeatError] = useState<string | null>(null);
-
-  const sendHeartbeat = async () => {
-    const acc = accounts.find((a) => a.publicKeyHex === heartbeatAccount);
-    if (!acc) {
-      setHeartbeatError('Select an account');
-      return;
-    }
-    setHeartbeatStatus('sending');
-    setHeartbeatError(null);
-    try {
-      const timestamp = Date.now();
-      const payload = {
-        timestamp,
-        heart_rate: heartRate,
-        motion: { x: motionX, y: motionY, z: motionZ },
-        temperature: temp,
-        device_pubkey: acc.publicKeyHex,
-      };
-      const signableBytes = heartbeatSignablePayload(payload);
-      const signature = await sign(acc.privateKeyHex, signableBytes);
-      const body = { ...payload, signature };
-      const res = await submitHeartbeat(nodeUrl, body);
-      if (res.success) {
-        setHeartbeatStatus('ok');
-        setLastHeartbeatByPubkey((prev) => ({ ...prev, [acc.publicKeyHex]: signature }));
-      } else {
-        setHeartbeatStatus('err');
-        setHeartbeatError(res.error ?? 'Failed');
-      }
-    } catch (e) {
-      setHeartbeatStatus('err');
-      setHeartbeatError(e instanceof Error ? e.message : 'Failed');
-    }
-  };
-
-  return (
-    <section>
-      <h2>Simulate</h2>
-
-      <div style={{ background: '#18181b', borderRadius: 8, padding: 16, marginBottom: 24 }}>
-        <h3 style={{ margin: '0 0 12px 0', fontSize: 14, color: '#a1a1aa' }}>Send heartbeat</h3>
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 12, maxWidth: 400 }}>
-          <label>
-            Account
-            <select
-              value={heartbeatAccount}
-              onChange={(e) => setHeartbeatAccount(e.target.value)}
-              style={{ display: 'block', marginTop: 4, padding: '8px 12px', width: '100%', borderRadius: 6, border: '1px solid #3f3f46', background: '#27272a', color: '#e4e4e7' }}
-            >
-              <option value="">Select…</option>
-              {accounts.map((a) => (
-                <option key={a.publicKeyHex} value={a.publicKeyHex}>{a.label}</option>
-              ))}
-            </select>
-          </label>
-          <label>
-            Heart rate (BPM)
-            <input type="number" min={30} max={220} value={heartRate} onChange={(e) => setHeartRate(Number(e.target.value))} style={{ display: 'block', marginTop: 4, padding: '8px 12px', width: '100%', borderRadius: 6, border: '1px solid #3f3f46', background: '#27272a', color: '#e4e4e7' }} />
-          </label>
-          <label>
-            Motion (x, y, z)
-            <div style={{ display: 'flex', gap: 8, marginTop: 4 }}>
-              <input type="number" step={0.01} value={motionX} onChange={(e) => setMotionX(Number(e.target.value))} style={{ flex: 1, padding: '8px 12px', borderRadius: 6, border: '1px solid #3f3f46', background: '#27272a', color: '#e4e4e7' }} />
-              <input type="number" step={0.01} value={motionY} onChange={(e) => setMotionY(Number(e.target.value))} style={{ flex: 1, padding: '8px 12px', borderRadius: 6, border: '1px solid #3f3f46', background: '#27272a', color: '#e4e4e7' }} />
-              <input type="number" step={0.01} value={motionZ} onChange={(e) => setMotionZ(Number(e.target.value))} style={{ flex: 1, padding: '8px 12px', borderRadius: 6, border: '1px solid #3f3f46', background: '#27272a', color: '#e4e4e7' }} />
-            </div>
-          </label>
-          <label>
-            Temperature (°C)
-            <input type="number" step={0.1} value={temp} onChange={(e) => setTemp(Number(e.target.value))} style={{ display: 'block', marginTop: 4, padding: '8px 12px', width: '100%', borderRadius: 6, border: '1px solid #3f3f46', background: '#27272a', color: '#e4e4e7' }} />
-          </label>
-          <button onClick={sendHeartbeat} disabled={heartbeatStatus === 'sending'} style={{ padding: '8px 16px', borderRadius: 6, border: 'none', background: '#22c55e', color: '#fff' }}>
-            {heartbeatStatus === 'sending' ? 'Sending…' : 'Send heartbeat'}
-          </button>
-          {heartbeatStatus === 'ok' && <span style={{ color: '#22c55e' }}>Heartbeat accepted.</span>}
-          {heartbeatStatus === 'err' && heartbeatError && <span style={{ color: '#f87171' }}>{heartbeatError}</span>}
-        </div>
-      </div>
-
-      <SendTransaction nodeUrl={nodeUrl} accounts={accounts} lastHeartbeatByPubkey={lastHeartbeatByPubkey} />
-    </section>
-  );
-}
-
-function SendTransaction({
-  nodeUrl,
-  accounts,
-  lastHeartbeatByPubkey,
-}: {
-  nodeUrl: string;
-  accounts: StoredAccount[];
-  lastHeartbeatByPubkey: Record<string, string>;
-}) {
-  const [sender, setSender] = useState('');
-  const [recipient, setRecipient] = useState('');
-  const [amount, setAmount] = useState(10);
-  const [status, setStatus] = useState<'idle' | 'sending' | 'ok' | 'err'>('idle');
-  const [error, setError] = useState<string | null>(null);
-
-  const senderLastSig = sender ? lastHeartbeatByPubkey[sender] : null;
-
-  const sendTx = async () => {
-    const senderAcc = accounts.find((a) => a.publicKeyHex === sender);
-    if (!senderAcc) {
-      setError('Select sender');
-      return;
-    }
-    if (!recipient.trim()) {
-      setError('Enter recipient pubkey');
-      return;
-    }
-    if (!senderLastSig) {
-      setError('Send a heartbeat from the sender first');
-      return;
-    }
-    setStatus('sending');
-    setError(null);
-    try {
-      const timestamp = Date.now();
-      const txId = `tx_${timestamp}`;
-      const payload = {
-        tx_id: txId,
-        sender_pubkey: senderAcc.publicKeyHex,
-        recipient_pubkey: recipient.trim(),
-        amount,
-        timestamp,
-        heartbeat_signature: senderLastSig,
-      };
-      const signableBytes = transactionSignablePayload(payload);
-      const signature = await sign(senderAcc.privateKeyHex, signableBytes);
-      const body = { ...payload, signature };
-      const res = await submitTransaction(nodeUrl, body);
-      if (res.success) {
-        setStatus('ok');
-      } else {
-        setStatus('err');
-        setError(res.error ?? 'Failed');
-      }
-    } catch (e) {
-      setStatus('err');
-      setError(e instanceof Error ? e.message : 'Failed');
-    }
-  };
-
-  return (
-    <div style={{ background: '#18181b', borderRadius: 8, padding: 16 }}>
-      <h3 style={{ margin: '0 0 12px 0', fontSize: 14, color: '#a1a1aa' }}>Send transaction</h3>
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 12, maxWidth: 400 }}>
-        <label>
-          Sender
-          <select value={sender} onChange={(e) => setSender(e.target.value)} style={{ display: 'block', marginTop: 4, padding: '8px 12px', width: '100%', borderRadius: 6, border: '1px solid #3f3f46', background: '#27272a', color: '#e4e4e7' }}>
-            <option value="">Select…</option>
-            {accounts.map((a) => (
-              <option key={a.publicKeyHex} value={a.publicKeyHex}>{a.label}</option>
-            ))}
-          </select>
-        </label>
-        <label>
-          Recipient (pubkey or select below)
-          <input value={recipient} onChange={(e) => setRecipient(e.target.value)} placeholder="Paste pubkey or choose account" style={{ display: 'block', marginTop: 4, padding: '8px 12px', width: '100%', borderRadius: 6, border: '1px solid #3f3f46', background: '#27272a', color: '#e4e4e7' }} />
-          <select onChange={(e) => e.target.value && setRecipient(e.target.value)} style={{ marginTop: 4, padding: '8px 12px', width: '100%', borderRadius: 6, border: '1px solid #3f3f46', background: '#27272a', color: '#e4e4e7' }}>
-            <option value="">Choose account…</option>
-            {accounts.map((a) => (
-              <option key={a.publicKeyHex} value={a.publicKeyHex}>{a.label} ({a.publicKeyHex.slice(0, 16)}…)</option>
-            ))}
-          </select>
-        </label>
-        <label>
-          Amount (PULSE)
-          <input type="number" min={0} step={0.01} value={amount} onChange={(e) => setAmount(Number(e.target.value))} style={{ display: 'block', marginTop: 4, padding: '8px 12px', width: '100%', borderRadius: 6, border: '1px solid #3f3f46', background: '#27272a', color: '#e4e4e7' }} />
-        </label>
-        {sender && !senderLastSig && <p style={{ color: '#fbbf24', margin: 0 }}>Send a heartbeat from the sender first so the transaction can reference it.</p>}
-        <button onClick={sendTx} disabled={status === 'sending' || !senderLastSig} style={{ padding: '8px 16px', borderRadius: 6, border: 'none', background: '#22c55e', color: '#fff' }}>
-          {status === 'sending' ? 'Sending…' : 'Send transaction'}
-        </button>
-        {status === 'ok' && <span style={{ color: '#22c55e' }}>Transaction queued.</span>}
-        {status === 'err' && error && <span style={{ color: '#f87171' }}>{error}</span>}
-      </div>
-    </div>
   );
 }
