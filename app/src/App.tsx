@@ -5,7 +5,7 @@ import { loadAccounts, addAccount, removeAccount, type StoredAccount } from './s
 
 const NODE_URL = 'https://topics-besides-index-portsmouth.trycloudflare.com';
 
-type Page = 'dashboard' | 'chain' | 'accounts';
+type Page = 'dashboard' | 'chain' | 'accounts' | 'whitepaper';
 
 export default function App() {
   const [connected, setConnected] = useState(false);
@@ -81,11 +81,18 @@ export default function App() {
         >
           Accounts
         </button>
+        <button
+          onClick={() => setPage('whitepaper')}
+          style={{ padding: '6px 12px', borderRadius: 6, border: '1px solid #3f3f46', background: page === 'whitepaper' ? '#3f3f46' : '#18181b', color: '#e4e4e7' }}
+        >
+          Whitepaper
+        </button>
       </nav>
 
       {page === 'dashboard' && <Dashboard nodeUrl={NODE_URL} />}
       {page === 'chain' && <ChainView nodeUrl={NODE_URL} />}
       {page === 'accounts' && <Accounts nodeUrl={NODE_URL} />}
+      {page === 'whitepaper' && <Whitepaper />}
     </div>
   );
 }
