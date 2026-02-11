@@ -20,6 +20,7 @@ use tracing_subscriber::FmtSubscriber;
 
 use pulse_node::{
     api::{self, AppState},
+    api::websocket::WsEvent,
     consensus::{ConsensusConfig, ProofOfLife},
     crypto::Keypair,
     storage::Storage,
@@ -165,17 +166,34 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn run_node(state: AppState, config: &Config) -> anyhow::Result<()> {
-    // Spawn block production loop
+    // Start API server (returns broadcaster for block loop)
+    let addr = format!("0.0.0.0:{}", config.api_port);
+    let broadcaster = api::start_server(state.clone(), &addr).await?;
+    
+    // Spawn block production loop with WebSocket broadcasting
     let block_state = state.clone();
     let block_interval = config.block_interval_ms;
+    let block_broadcaster = broadcaster.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_millis(block_interval));
         loop {
             interval.tick().await;
             
             let mut pol = block_state.write().await;
-            if let Ok(Some(_block)) = pol.try_create_block() {
-                // Block created, committed, and persisted
+            
+            // Broadcast heartbeat pool size
+            let pool_size = pol.heartbeat_pool_size();
+            if pool_size > 0 {
+                block_broadcaster.broadcast(WsEvent::HeartbeatCount { count: pool_size });
+            }
+            
+            if let Ok(Some(block)) = pol.try_create_block() {
+                // Broadcast new block to WebSocket clients
+                block_broadcaster.broadcast(WsEvent::NewBlock { block });
+                
+                // Broadcast updated stats
+                let stats = pol.get_stats();
+                block_broadcaster.broadcast(WsEvent::Stats { stats });
             }
         }
     });
@@ -188,9 +206,10 @@ async fn run_node(state: AppState, config: &Config) -> anyhow::Result<()> {
         });
     }
     
-    // Start API server
-    let addr = format!("0.0.0.0:{}", config.api_port);
-    api::start_server(state, &addr).await?;
+    // Keep main alive
+    info!("🚀 Pulse node running!");
+    tokio::signal::ctrl_c().await?;
+    info!("👋 Shutting down...");
     
     Ok(())
 }

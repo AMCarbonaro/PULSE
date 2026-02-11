@@ -2,15 +2,16 @@
 //! Endpoints for devices to submit heartbeats and query network state.
 
 pub mod rate_limit;
+pub mod websocket;
 
 use axum::{
-    extract::{ConnectInfo, Path, State, Json},
+    extract::{ConnectInfo, Path, Query, State, Json},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
     Router,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,16 +22,25 @@ use tracing::info;
 use crate::consensus::ProofOfLife;
 use crate::types::{Account, Heartbeat, Transaction};
 use rate_limit::{RateLimiter, RateLimitConfig};
+pub use websocket::WsBroadcaster;
 
 /// Shared application state
 pub type AppState = Arc<RwLock<ProofOfLife>>;
 
-/// Combined app state with rate limiter
+/// Combined app state with rate limiter and WebSocket broadcaster
 #[derive(Clone)]
 pub struct ApiState {
     pub consensus: AppState,
     pub pulse_limiter: RateLimiter,   // Strict: heartbeat submissions
     pub query_limiter: RateLimiter,   // Lenient: read queries
+    pub ws_broadcaster: Arc<WsBroadcaster>,
+}
+
+/// Pagination query parameters
+#[derive(Deserialize)]
+pub struct PaginationParams {
+    pub offset: Option<u64>,
+    pub limit: Option<u64>,
 }
 
 /// API response wrapper
@@ -55,8 +65,11 @@ impl ApiResponse<()> {
     }
 }
 
-/// Create the API router
-pub fn create_router(state: AppState) -> Router {
+/// Create the API router, returning both the Router and the WsBroadcaster
+/// so the block production loop can broadcast events.
+pub fn create_router(state: AppState) -> (Router, Arc<WsBroadcaster>) {
+    let ws_broadcaster = Arc::new(WsBroadcaster::new(256));
+    
     let api_state = ApiState {
         consensus: state,
         pulse_limiter: RateLimiter::new(RateLimitConfig {
@@ -67,6 +80,7 @@ pub fn create_router(state: AppState) -> Router {
             max_requests: 120,                   // 120 queries per minute per IP
             window: Duration::from_secs(60),
         }),
+        ws_broadcaster: ws_broadcaster.clone(),
     };
 
     // Spawn rate limiter cleanup task
@@ -80,7 +94,7 @@ pub fn create_router(state: AppState) -> Router {
         }
     });
 
-    Router::new()
+    let router = Router::new()
         // Health check
         .route("/health", get(health_check))
         // Heartbeat submission
@@ -95,9 +109,13 @@ pub fn create_router(state: AppState) -> Router {
         .route("/blocks", get(get_blocks))
         .route("/block/:index", get(get_block_by_index))
         .route("/chain", get(get_chain_info))
+        // WebSocket for live updates
+        .route("/ws", get(websocket::ws_handler).with_state(ws_broadcaster.clone()))
         // Add CORS for device access
         .layer(CorsLayer::permissive())
-        .with_state(api_state)
+        .with_state(api_state);
+
+    (router, ws_broadcaster)
 }
 
 /// Health check endpoint
@@ -307,10 +325,11 @@ async fn get_latest_block(
     }
 }
 
-/// Get full chain (genesis to tip)
+/// Get blocks with pagination (default: latest 50)
 async fn get_blocks(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<ApiState>,
+    Query(params): Query<PaginationParams>,
 ) -> impl IntoResponse {
     let ip = addr.ip().to_string();
     if !state.query_limiter.check(&ip).await {
@@ -321,7 +340,32 @@ async fn get_blocks(
     }
 
     let pol = state.consensus.read().await;
-    Json(ApiResponse::ok(pol.get_blocks())).into_response()
+    let all_blocks = pol.get_blocks();
+    let total = all_blocks.len() as u64;
+    
+    // Default: latest 50 blocks
+    let limit = params.limit.unwrap_or(50).min(200); // cap at 200
+    let offset = params.offset.unwrap_or(total.saturating_sub(limit));
+    
+    let blocks: Vec<_> = all_blocks.into_iter()
+        .skip(offset as usize)
+        .take(limit as usize)
+        .collect();
+
+    #[derive(Serialize)]
+    struct PaginatedBlocks {
+        blocks: Vec<crate::types::PulseBlock>,
+        total: u64,
+        offset: u64,
+        limit: u64,
+    }
+
+    Json(ApiResponse::ok(PaginatedBlocks {
+        blocks,
+        total,
+        offset,
+        limit,
+    })).into_response()
 }
 
 /// Get block by index
@@ -378,13 +422,20 @@ async fn get_chain_info(
     Json(ApiResponse::ok(info)).into_response()
 }
 
-/// Start the API server
-pub async fn start_server(state: AppState, addr: &str) -> anyhow::Result<()> {
-    let router = create_router(state);
+/// Start the API server, returning the WsBroadcaster for the block loop to use
+pub async fn start_server(state: AppState, addr: &str) -> anyhow::Result<Arc<WsBroadcaster>> {
+    let (router, broadcaster) = create_router(state);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     
     info!("🌐 API server listening on {}", addr);
-    axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>()).await?;
+    info!("🔌 WebSocket endpoint: ws://{}/ws", addr);
     
-    Ok(())
+    let bc = broadcaster.clone();
+    tokio::spawn(async move {
+        axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>())
+            .await
+            .unwrap();
+    });
+    
+    Ok(bc)
 }
