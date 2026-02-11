@@ -1,7 +1,8 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { health, getStats, getChain, getLatestBlock, getBlocks, getBalance, getAccounts, submitHeartbeat, submitTransaction, type NetworkStats, type ChainInfo, type PulseBlock } from './api';
 import { generateKeypair, sign, heartbeatSignablePayload, transactionSignablePayload } from './crypto';
 import { loadAccounts, addAccount, removeAccount, type StoredAccount } from './storage';
+import { useWebSocket, type WsEvent } from './useWebSocket';
 
 const NODE_URL = 'https://pulse.carbonaromedia.com';
 
@@ -194,9 +195,42 @@ function Dashboard({ nodeUrl }: { nodeUrl: string }) {
   const [stats, setStats] = useState<NetworkStats | null>(null);
   const [chain, setChain] = useState<ChainInfo | null>(null);
   const [block, setBlock] = useState<PulseBlock | null>(null);
+  const [heartbeatPoolSize, setHeartbeatPoolSize] = useState(0);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [blocksPerSecond, setBlocksPerSecond] = useState<string>('—');
+  const blockTimestamps = useRef<number[]>([]);
 
+  // WebSocket for live updates
+  const { status: wsStatus } = useWebSocket({
+    nodeUrl,
+    onEvent: useCallback((event: WsEvent) => {
+      switch (event.type) {
+        case 'new_block':
+          setBlock(event.block);
+          // Track block rate
+          const now = Date.now();
+          blockTimestamps.current.push(now);
+          // Keep last 20 blocks
+          if (blockTimestamps.current.length > 20) blockTimestamps.current.shift();
+          if (blockTimestamps.current.length > 1) {
+            const ts = blockTimestamps.current;
+            const elapsed = (ts[ts.length - 1] - ts[0]) / 1000;
+            const rate = (ts.length - 1) / elapsed;
+            setBlocksPerSecond(rate.toFixed(2));
+          }
+          break;
+        case 'stats':
+          setStats(event.stats);
+          break;
+        case 'heartbeat_count':
+          setHeartbeatPoolSize(event.count);
+          break;
+      }
+    }, []),
+  });
+
+  // Initial data load (one-time, WebSocket handles updates after)
   const refresh = async () => {
     setLoading(true);
     setError(null);
@@ -221,9 +255,12 @@ function Dashboard({ nodeUrl }: { nodeUrl: string }) {
 
   useEffect(() => {
     refresh();
-    const id = setInterval(refresh, 5000);
+    // Fallback polling only if WebSocket isn't connected (every 15s instead of 5s)
+    const id = setInterval(() => {
+      if (wsStatus !== 'connected') refresh();
+    }, 15000);
     return () => clearInterval(id);
-  }, [nodeUrl]);
+  }, [nodeUrl, wsStatus]);
 
   const card = (title: string, children: React.ReactNode) => (
     <div style={{ background: '#18181b', borderRadius: 8, padding: 16, marginBottom: 16 }}>
@@ -246,7 +283,24 @@ function Dashboard({ nodeUrl }: { nodeUrl: string }) {
       <h2 style={{ margin: 0 }}>Dashboard</h2>
       {error && <p style={{ color: '#f87171', marginTop: 8 }}>{error}</p>}
 
-      {card('Health', <p style={{ margin: 0 }}>{healthMsg ?? '—'}</p>)}
+      {card('Health', (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+          <p style={{ margin: 0 }}>{healthMsg ?? '—'}</p>
+          <span style={{
+            display: 'inline-flex', alignItems: 'center', gap: 6,
+            fontSize: 12, padding: '2px 8px', borderRadius: 12,
+            background: wsStatus === 'connected' ? '#052e16' : '#451a03',
+            color: wsStatus === 'connected' ? '#4ade80' : '#fbbf24',
+          }}>
+            <span style={{
+              width: 6, height: 6, borderRadius: '50%',
+              background: wsStatus === 'connected' ? '#4ade80' : '#fbbf24',
+              animation: wsStatus === 'connected' ? 'pulse-dot 2s infinite' : 'none',
+            }} />
+            {wsStatus === 'connected' ? 'Live' : wsStatus === 'connecting' ? 'Connecting…' : 'Polling'}
+          </span>
+        </div>
+      ))}
 
       {card('Network stats', (
         <dl style={{ margin: 0, display: 'grid', gridTemplateColumns: 'auto 1fr', gap: '4px 16px' }}>
@@ -267,9 +321,10 @@ function Dashboard({ nodeUrl }: { nodeUrl: string }) {
         <dl style={{ margin: 0, display: 'grid', gridTemplateColumns: 'auto 1fr', gap: '4px 16px' }}>
           {chain && (
             <>
-              <dt style={{ color: '#a1a1aa' }}>Height</dt><dd>{chain.height}</dd>
-              <dt style={{ color: '#a1a1aa' }}>Latest hash</dt><dd style={{ wordBreak: 'break-all', fontFamily: 'monospace', fontSize: 12 }}>{chain.latest_hash || '—'}</dd>
-              <dt style={{ color: '#a1a1aa' }}>Heartbeat pool size</dt><dd>{chain.heartbeat_pool_size}</dd>
+              <dt style={{ color: '#a1a1aa' }}>Height</dt><dd>{block ? block.index : chain.height}</dd>
+              <dt style={{ color: '#a1a1aa' }}>Latest hash</dt><dd style={{ wordBreak: 'break-all', fontFamily: 'monospace', fontSize: 12 }}>{block ? block.block_hash : chain.latest_hash || '—'}</dd>
+              <dt style={{ color: '#a1a1aa' }}>Heartbeat pool</dt><dd>{heartbeatPoolSize || chain.heartbeat_pool_size}</dd>
+              <dt style={{ color: '#a1a1aa' }}>Block rate</dt><dd>{blocksPerSecond} blocks/s</dd>
             </>
           )}
         </dl>
@@ -293,29 +348,40 @@ function Dashboard({ nodeUrl }: { nodeUrl: string }) {
 
 function ChainView({ nodeUrl }: { nodeUrl: string }) {
   const [blocks, setBlocks] = useState<PulseBlock[]>([]);
+  const [totalBlocks, setTotalBlocks] = useState(0);
+  const [currentPage, setCurrentPage] = useState(0); // 0 = latest
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [expandedIndex, setExpandedIndex] = useState<number | null>(null);
   const [blockSearch, setBlockSearch] = useState('');
+  const PAGE_SIZE = 50;
 
   const refresh = useCallback(async () => {
     setError(null);
     try {
-      const res = await getBlocks(nodeUrl);
-      if (res.success && res.data) setBlocks(res.data);
-      else setError(res.error ?? 'Failed to load chain');
+      // If on latest page, don't specify offset (server defaults to latest)
+      const offset = currentPage > 0 ? (totalBlocks - (currentPage + 1) * PAGE_SIZE) : undefined;
+      const res = await getBlocks(nodeUrl, offset !== undefined ? Math.max(0, offset) : undefined, PAGE_SIZE);
+      if (res.success && res.data) {
+        setBlocks(res.data.blocks);
+        setTotalBlocks(res.data.total);
+      } else {
+        setError(res.error ?? 'Failed to load chain');
+      }
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed to load chain');
     } finally {
       setLoading(false);
     }
-  }, [nodeUrl]);
+  }, [nodeUrl, currentPage, totalBlocks]);
 
   useEffect(() => {
     refresh();
-    const id = setInterval(refresh, 5000);
+    const id = setInterval(refresh, 10000);
     return () => clearInterval(id);
   }, [refresh]);
+
+  const totalPages = Math.ceil(totalBlocks / PAGE_SIZE);
 
   const formatTime = (ms: number) => {
     const d = new Date(ms);
@@ -416,6 +482,28 @@ function ChainView({ nodeUrl }: { nodeUrl: string }) {
             </div>
           ))}
           </div>
+          {/* Pagination */}
+          {totalPages > 1 && (
+            <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', gap: 12, marginTop: 16 }}>
+              <button
+                onClick={() => setCurrentPage(Math.min(currentPage + 1, totalPages - 1))}
+                disabled={currentPage >= totalPages - 1}
+                style={{ padding: '6px 12px', borderRadius: 6, border: '1px solid #3f3f46', background: '#27272a', color: '#e4e4e7', opacity: currentPage >= totalPages - 1 ? 0.4 : 1 }}
+              >
+                ← Older
+              </button>
+              <span style={{ fontSize: 13, color: '#a1a1aa' }}>
+                Page {currentPage + 1} of {totalPages} ({totalBlocks} blocks)
+              </span>
+              <button
+                onClick={() => setCurrentPage(Math.max(currentPage - 1, 0))}
+                disabled={currentPage === 0}
+                style={{ padding: '6px 12px', borderRadius: 6, border: '1px solid #3f3f46', background: '#27272a', color: '#e4e4e7', opacity: currentPage === 0 ? 0.4 : 1 }}
+              >
+                Newer →
+              </button>
+            </div>
+          )}
         </>
       )}
     </section>

@@ -96,9 +96,20 @@ export async function getLatestBlock(nodeUrl: string): Promise<ApiResponse<Pulse
   return parseJsonResponse<PulseBlock>(res);
 }
 
-export async function getBlocks(nodeUrl: string): Promise<ApiResponse<PulseBlock[]>> {
-  const res = await fetch(`${base(nodeUrl)}/blocks`);
-  return parseJsonResponse<PulseBlock[]>(res);
+export type PaginatedBlocks = {
+  blocks: PulseBlock[];
+  total: number;
+  offset: number;
+  limit: number;
+};
+
+export async function getBlocks(nodeUrl: string, offset?: number, limit?: number): Promise<ApiResponse<PaginatedBlocks>> {
+  const params = new URLSearchParams();
+  if (offset !== undefined) params.set('offset', String(offset));
+  if (limit !== undefined) params.set('limit', String(limit));
+  const qs = params.toString();
+  const res = await fetch(`${base(nodeUrl)}/blocks${qs ? '?' + qs : ''}`);
+  return parseJsonResponse<PaginatedBlocks>(res);
 }
 
 export async function getBlockByIndex(nodeUrl: string, index: number): Promise<ApiResponse<PulseBlock>> {
