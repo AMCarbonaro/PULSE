@@ -15,13 +15,14 @@
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
-use tracing::{info, Level};
+use tracing::{info, error, Level};
 use tracing_subscriber::FmtSubscriber;
 
 use pulse_node::{
     api::{self, AppState},
     consensus::{ConsensusConfig, ProofOfLife},
     crypto::Keypair,
+    storage::Storage,
     types::{Heartbeat, Motion},
 };
 
@@ -125,17 +126,45 @@ async fn main() -> anyhow::Result<()> {
     info!("  Threshold: {} participants", config.n_threshold);
     info!("  Block Interval: {}ms", config.block_interval_ms);
     
-    // Create consensus engine
+    // Create consensus engine with persistent storage
     let consensus_config = ConsensusConfig {
         n_threshold: config.n_threshold,
         block_interval_ms: config.block_interval_ms,
         reward_per_block: config.reward_per_block,
         ..Default::default()
     };
-    
-    let pol = ProofOfLife::new(consensus_config.clone());
+
+    // Open persistent storage
+    let storage = match Storage::open(&config.data_dir) {
+        Ok(s) => {
+            info!("💾 Storage opened at: {}", config.data_dir);
+            Arc::new(s)
+        }
+        Err(e) => {
+            error!("❌ Failed to open storage at {}: {}", config.data_dir, e);
+            error!("   Falling back to in-memory mode (data will NOT persist!)");
+            // Fall back to in-memory
+            let pol = ProofOfLife::new(consensus_config.clone());
+            let state: AppState = Arc::new(RwLock::new(pol));
+            return run_node(state, &config).await;
+        }
+    };
+
+    // Create consensus engine with storage (loads existing chain if present)
+    let pol = match ProofOfLife::with_storage(consensus_config.clone(), storage) {
+        Ok(p) => p,
+        Err(e) => {
+            error!("❌ Failed to load chain from storage: {}", e);
+            error!("   Starting fresh with in-memory mode");
+            ProofOfLife::new(consensus_config.clone())
+        }
+    };
+
     let state: AppState = Arc::new(RwLock::new(pol));
-    
+    run_node(state, &config).await
+}
+
+async fn run_node(state: AppState, config: &Config) -> anyhow::Result<()> {
     // Spawn block production loop
     let block_state = state.clone();
     let block_interval = config.block_interval_ms;
@@ -146,8 +175,7 @@ async fn main() -> anyhow::Result<()> {
             
             let mut pol = block_state.write().await;
             if let Ok(Some(_block)) = pol.try_create_block() {
-                // Block created and committed
-                // In production, would broadcast to peers here
+                // Block created, committed, and persisted
             }
         }
     });

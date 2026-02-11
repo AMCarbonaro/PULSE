@@ -1,11 +1,13 @@
 //! Proof-of-Life consensus engine for the Pulse Network.
 
 use crate::crypto::{verify_signature, CryptoError};
+use crate::storage::Storage;
 use crate::types::{Heartbeat, PulseBlock, Transaction, Account};
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
-use tracing::{info, warn, debug};
+use tracing::{info, warn, debug, error};
 
 #[derive(Error, Debug)]
 pub enum ConsensusError {
@@ -25,6 +27,8 @@ pub enum ConsensusError {
     SenderNotPulsing,
     #[error("Crypto error: {0}")]
     Crypto(#[from] CryptoError),
+    #[error("Storage error: {0}")]
+    Storage(#[from] crate::storage::StorageError),
 }
 
 /// Configuration for the consensus engine
@@ -67,10 +71,12 @@ pub struct ProofOfLife {
     accounts: HashMap<String, Account>,
     /// Total tokens minted
     total_minted: f64,
+    /// Persistent storage (optional — None means in-memory only)
+    storage: Option<Arc<Storage>>,
 }
 
 impl ProofOfLife {
-    /// Create a new consensus engine with genesis block
+    /// Create a new consensus engine with genesis block (in-memory only)
     pub fn new(config: ConsensusConfig) -> Self {
         let genesis = Self::create_genesis_block();
         info!("🌱 Genesis block created: {}...", &genesis.block_hash[..16]);
@@ -82,6 +88,67 @@ impl ProofOfLife {
             tx_pool: Vec::new(),
             accounts: HashMap::new(),
             total_minted: 0.0,
+            storage: None,
+        }
+    }
+
+    /// Create a new consensus engine with persistent storage.
+    /// Loads existing chain from disk if present, otherwise creates genesis.
+    pub fn with_storage(config: ConsensusConfig, storage: Arc<Storage>) -> Result<Self, ConsensusError> {
+        // Try to load existing chain
+        let stored_blocks = storage.load_all_blocks()?;
+        let stored_accounts = storage.load_all_accounts()?;
+        
+        if !stored_blocks.is_empty() {
+            // Reconstruct from storage
+            let chain_height = stored_blocks.last().map(|b| b.index).unwrap_or(0);
+            
+            // Rebuild accounts map
+            let mut accounts = HashMap::new();
+            for account in stored_accounts {
+                accounts.insert(account.pubkey.clone(), account);
+            }
+            
+            // Calculate total minted from accounts
+            let total_minted: f64 = accounts.values().map(|a| a.total_earned).sum();
+            
+            info!("💾 Loaded chain from storage:");
+            info!("   Chain height: {}", chain_height);
+            info!("   Blocks: {}", stored_blocks.len());
+            info!("   Accounts: {}", accounts.len());
+            info!("   Total minted: {:.4} PULSE", total_minted);
+            
+            Ok(Self {
+                config,
+                chain: stored_blocks,
+                heartbeat_pool: HashMap::new(),
+                tx_pool: Vec::new(),
+                accounts,
+                total_minted,
+                storage: Some(storage),
+            })
+        } else {
+            // Fresh start with genesis
+            let genesis = Self::create_genesis_block();
+            info!("🌱 Genesis block created: {}...", &genesis.block_hash[..16]);
+            
+            // Persist genesis block
+            if let Err(e) = storage.save_block(&genesis) {
+                error!("Failed to save genesis block: {}", e);
+            }
+            if let Err(e) = storage.flush() {
+                error!("Failed to flush storage: {}", e);
+            }
+            
+            Ok(Self {
+                config,
+                chain: vec![genesis],
+                heartbeat_pool: HashMap::new(),
+                tx_pool: Vec::new(),
+                accounts: HashMap::new(),
+                total_minted: 0.0,
+                storage: Some(storage),
+            })
         }
     }
     
@@ -99,6 +166,33 @@ impl ProofOfLife {
         };
         block.block_hash = block.compute_hash();
         block
+    }
+
+    /// Persist a block and its affected accounts to storage
+    fn persist_block(&self, block: &PulseBlock, affected_pubkeys: &[String]) {
+        if let Some(ref storage) = self.storage {
+            // Save block
+            if let Err(e) = storage.save_block(block) {
+                error!("❌ Failed to persist block #{}: {}", block.index, e);
+                return;
+            }
+            
+            // Save affected accounts
+            for pubkey in affected_pubkeys {
+                if let Some(account) = self.accounts.get(pubkey) {
+                    if let Err(e) = storage.save_account(account) {
+                        error!("❌ Failed to persist account {}...: {}", &pubkey[..8], e);
+                    }
+                }
+            }
+            
+            // Flush to disk
+            if let Err(e) = storage.flush() {
+                error!("❌ Failed to flush storage: {}", e);
+            } else {
+                debug!("💾 Block #{} persisted to disk", block.index);
+            }
+        }
     }
     
     /// Verify and add a heartbeat to the pool
@@ -208,6 +302,9 @@ impl ProofOfLife {
         info!("   Security (S): {:.4}", security);
         info!("   Fork probability: {:.6}", fork_prob);
         
+        // Track affected accounts for persistence
+        let mut affected_pubkeys: Vec<String> = Vec::new();
+        
         // Distribute rewards
         if total_weight > 0.0 {
             for hb in &heartbeats {
@@ -226,6 +323,7 @@ impl ProofOfLife {
                 account.blocks_participated += 1;
                 
                 self.total_minted += reward;
+                affected_pubkeys.push(hb.device_pubkey.clone());
                 
                 info!("   💰 {}... earned {:.4} PULSE", &hb.device_pubkey[..8], reward);
             }
@@ -235,6 +333,7 @@ impl ProofOfLife {
         for tx in &self.tx_pool {
             if let Some(sender) = self.accounts.get_mut(&tx.sender_pubkey) {
                 sender.balance -= tx.amount;
+                affected_pubkeys.push(tx.sender_pubkey.clone());
             }
             
             let recipient = self.accounts
@@ -244,13 +343,17 @@ impl ProofOfLife {
                     ..Default::default()
                 });
             recipient.balance += tx.amount;
+            affected_pubkeys.push(tx.recipient_pubkey.clone());
             
             info!("   📤 TX: {}... → {}... ({} PULSE)",
                 &tx.sender_pubkey[..8], &tx.recipient_pubkey[..8], tx.amount);
         }
         
-        // Commit block
+        // Commit block to chain
         self.chain.push(block.clone());
+        
+        // Persist to storage
+        self.persist_block(&block, &affected_pubkeys);
         
         // Clear pools
         self.heartbeat_pool.clear();
@@ -360,5 +463,26 @@ mod tests {
         
         assert!(block.is_some());
         assert_eq!(pol.chain_height(), 1);
+    }
+
+    #[test]
+    fn test_storage_persistence() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Arc::new(Storage::open(dir.path()).unwrap());
+        
+        let config = ConsensusConfig::default();
+        let mut pol = ProofOfLife::with_storage(config.clone(), storage.clone()).unwrap();
+        
+        // Create a block
+        let kp = Keypair::generate();
+        let hb = create_test_heartbeat(&kp);
+        pol.receive_heartbeat(hb).unwrap();
+        pol.try_create_block().unwrap();
+        
+        assert_eq!(pol.chain_height(), 1);
+        
+        // Reconstruct from storage — chain should be restored
+        let pol2 = ProofOfLife::with_storage(config, storage).unwrap();
+        assert_eq!(pol2.chain_height(), 1);
     }
 }

@@ -1,24 +1,37 @@
 //! HTTP API for the Pulse Node.
 //! Endpoints for devices to submit heartbeats and query network state.
 
+pub mod rate_limit;
+
 use axum::{
-    extract::{Path, State, Json},
+    extract::{ConnectInfo, Path, State, Json},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
     Router,
 };
 use serde::Serialize;
+use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::RwLock;
 use tower_http::cors::CorsLayer;
 use tracing::info;
 
 use crate::consensus::ProofOfLife;
 use crate::types::{Account, Heartbeat, Transaction};
+use rate_limit::{RateLimiter, RateLimitConfig};
 
 /// Shared application state
 pub type AppState = Arc<RwLock<ProofOfLife>>;
+
+/// Combined app state with rate limiter
+#[derive(Clone)]
+pub struct ApiState {
+    pub consensus: AppState,
+    pub pulse_limiter: RateLimiter,   // Strict: heartbeat submissions
+    pub query_limiter: RateLimiter,   // Lenient: read queries
+}
 
 /// API response wrapper
 #[derive(Serialize)]
@@ -44,6 +57,29 @@ impl ApiResponse<()> {
 
 /// Create the API router
 pub fn create_router(state: AppState) -> Router {
+    let api_state = ApiState {
+        consensus: state,
+        pulse_limiter: RateLimiter::new(RateLimitConfig {
+            max_requests: 30,                    // 30 heartbeats per minute per IP
+            window: Duration::from_secs(60),
+        }),
+        query_limiter: RateLimiter::new(RateLimitConfig {
+            max_requests: 120,                   // 120 queries per minute per IP
+            window: Duration::from_secs(60),
+        }),
+    };
+
+    // Spawn rate limiter cleanup task
+    let cleanup_state = api_state.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(300));
+        loop {
+            interval.tick().await;
+            cleanup_state.pulse_limiter.cleanup().await;
+            cleanup_state.query_limiter.cleanup().await;
+        }
+    });
+
     Router::new()
         // Health check
         .route("/health", get(health_check))
@@ -56,12 +92,12 @@ pub fn create_router(state: AppState) -> Router {
         .route("/balance/{pubkey}", get(get_balance))
         .route("/accounts", get(get_accounts))
         .route("/block/latest", get(get_latest_block))
-        .route("/blocks", get(get_blocks))  // before /block/:index so literal path matches first
+        .route("/blocks", get(get_blocks))
         .route("/block/:index", get(get_block_by_index))
         .route("/chain", get(get_chain_info))
         // Add CORS for device access
         .layer(CorsLayer::permissive())
-        .with_state(state)
+        .with_state(api_state)
 }
 
 /// Health check endpoint
@@ -71,10 +107,49 @@ async fn health_check() -> impl IntoResponse {
 
 /// Submit a heartbeat
 async fn submit_heartbeat(
-    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<ApiState>,
     Json(heartbeat): Json<Heartbeat>,
 ) -> impl IntoResponse {
-    let mut pol = state.write().await;
+    // Rate limit by IP
+    let ip = addr.ip().to_string();
+    if !state.pulse_limiter.check(&ip).await {
+        return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({
+            "success": false,
+            "error": "Rate limit exceeded. Max 30 heartbeats per minute."
+        })));
+    }
+
+    // Input validation
+    if heartbeat.device_pubkey.len() < 32 || heartbeat.device_pubkey.len() > 256 {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "success": false,
+            "error": "Invalid public key length"
+        })));
+    }
+
+    if heartbeat.signature.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "success": false,
+            "error": "Signature is required"
+        })));
+    }
+
+    if heartbeat.heart_rate == 0 || heartbeat.heart_rate > 300 {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "success": false,
+            "error": "Heart rate out of range (1-300)"
+        })));
+    }
+
+    if heartbeat.temperature < 25.0 || heartbeat.temperature > 45.0 {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "success": false,
+            "error": "Temperature out of range (25-45°C)"
+        })));
+    }
+
+    let mut pol = state.consensus.write().await;
     
     match pol.receive_heartbeat(heartbeat) {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({
@@ -90,10 +165,42 @@ async fn submit_heartbeat(
 
 /// Submit a transaction
 async fn submit_transaction(
-    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<ApiState>,
     Json(tx): Json<Transaction>,
 ) -> impl IntoResponse {
-    let mut pol = state.write().await;
+    // Rate limit
+    let ip = addr.ip().to_string();
+    if !state.pulse_limiter.check(&ip).await {
+        return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({
+            "success": false,
+            "error": "Rate limit exceeded"
+        })));
+    }
+
+    // Input validation
+    if tx.amount <= 0.0 {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "success": false,
+            "error": "Amount must be positive"
+        })));
+    }
+
+    if tx.sender_pubkey == tx.recipient_pubkey {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "success": false,
+            "error": "Cannot send to yourself"
+        })));
+    }
+
+    if tx.signature.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "success": false,
+            "error": "Signature is required"
+        })));
+    }
+
+    let mut pol = state.consensus.write().await;
     
     match pol.receive_transaction(tx) {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({
@@ -109,18 +216,41 @@ async fn submit_transaction(
 
 /// Get network statistics
 async fn get_stats(
-    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<ApiState>,
 ) -> impl IntoResponse {
-    let pol = state.read().await;
-    Json(ApiResponse::ok(pol.get_stats()))
+    let ip = addr.ip().to_string();
+    if !state.query_limiter.check(&ip).await {
+        return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({
+            "success": false,
+            "error": "Rate limit exceeded"
+        }))).into_response();
+    }
+
+    let pol = state.consensus.read().await;
+    Json(ApiResponse::ok(pol.get_stats())).into_response()
 }
 
 /// Get account balance
 async fn get_balance(
-    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<ApiState>,
     axum::extract::Path(pubkey): axum::extract::Path<String>,
 ) -> impl IntoResponse {
-    let pol = state.read().await;
+    let ip = addr.ip().to_string();
+    if !state.query_limiter.check(&ip).await {
+        return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({
+            "success": false,
+            "error": "Rate limit exceeded"
+        }))).into_response();
+    }
+
+    // Validate pubkey format
+    if pubkey.len() < 32 || pubkey.len() > 256 || !pubkey.chars().all(|c| c.is_ascii_hexdigit()) {
+        return (StatusCode::BAD_REQUEST, Json(ApiResponse::<()>::err("Invalid public key format"))).into_response();
+    }
+
+    let pol = state.consensus.read().await;
     let balance = pol.get_balance(&pubkey);
     
     #[derive(Serialize)]
@@ -129,46 +259,86 @@ async fn get_balance(
         balance: f64,
     }
     
-    Json(ApiResponse::ok(BalanceResponse { pubkey, balance }))
+    Json(ApiResponse::ok(BalanceResponse { pubkey, balance })).into_response()
 }
 
 /// Get all accounts (network view)
-async fn get_accounts(State(state): State<AppState>) -> impl IntoResponse {
-    let pol = state.read().await;
+async fn get_accounts(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<ApiState>,
+) -> impl IntoResponse {
+    let ip = addr.ip().to_string();
+    if !state.query_limiter.check(&ip).await {
+        return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({
+            "success": false,
+            "error": "Rate limit exceeded"
+        }))).into_response();
+    }
+
+    let pol = state.consensus.read().await;
     let accounts: Vec<Account> = pol.get_accounts().values().cloned().collect();
-    Json(ApiResponse::ok(accounts))
+    Json(ApiResponse::ok(accounts)).into_response()
 }
 
 /// Get the latest block
 async fn get_latest_block(
-    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<ApiState>,
 ) -> impl IntoResponse {
-    let pol = state.read().await;
+    let ip = addr.ip().to_string();
+    if !state.query_limiter.check(&ip).await {
+        return Json(serde_json::json!({
+            "success": false,
+            "error": "Rate limit exceeded"
+        })).into_response();
+    }
+
+    let pol = state.consensus.read().await;
     
     match pol.latest_block() {
         Some(block) => Json(serde_json::json!({
             "success": true,
             "data": block
-        })),
+        })).into_response(),
         None => Json(serde_json::json!({
             "success": false,
             "error": "No blocks yet"
-        })),
+        })).into_response(),
     }
 }
 
 /// Get full chain (genesis to tip)
-async fn get_blocks(State(state): State<AppState>) -> impl IntoResponse {
-    let pol = state.read().await;
-    Json(ApiResponse::ok(pol.get_blocks()))
+async fn get_blocks(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<ApiState>,
+) -> impl IntoResponse {
+    let ip = addr.ip().to_string();
+    if !state.query_limiter.check(&ip).await {
+        return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({
+            "success": false,
+            "error": "Rate limit exceeded"
+        }))).into_response();
+    }
+
+    let pol = state.consensus.read().await;
+    Json(ApiResponse::ok(pol.get_blocks())).into_response()
 }
 
 /// Get block by index
 async fn get_block_by_index(
-    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<ApiState>,
     Path(index): Path<u64>,
 ) -> impl IntoResponse {
-    let pol = state.read().await;
+    let ip = addr.ip().to_string();
+    if !state.query_limiter.check(&ip).await {
+        return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({
+            "success": false,
+            "error": "Rate limit exceeded"
+        }))).into_response();
+    }
+
+    let pol = state.consensus.read().await;
     match pol.get_block_by_index(index) {
         Some(block) => (StatusCode::OK, Json(ApiResponse::ok(block))).into_response(),
         None => (StatusCode::NOT_FOUND, Json(ApiResponse::<()>::err("Block not found"))).into_response(),
@@ -177,9 +347,18 @@ async fn get_block_by_index(
 
 /// Get chain info
 async fn get_chain_info(
-    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<ApiState>,
 ) -> impl IntoResponse {
-    let pol = state.read().await;
+    let ip = addr.ip().to_string();
+    if !state.query_limiter.check(&ip).await {
+        return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({
+            "success": false,
+            "error": "Rate limit exceeded"
+        }))).into_response();
+    }
+
+    let pol = state.consensus.read().await;
     
     #[derive(Serialize)]
     struct ChainInfo {
@@ -196,7 +375,7 @@ async fn get_chain_info(
         heartbeat_pool_size: pol.heartbeat_pool_size(),
     };
     
-    Json(ApiResponse::ok(info))
+    Json(ApiResponse::ok(info)).into_response()
 }
 
 /// Start the API server
@@ -205,7 +384,7 @@ pub async fn start_server(state: AppState, addr: &str) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     
     info!("🌐 API server listening on {}", addr);
-    axum::serve(listener, router).await?;
+    axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>()).await?;
     
     Ok(())
 }
