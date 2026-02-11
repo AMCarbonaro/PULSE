@@ -1,6 +1,7 @@
 //! Core data types for the Pulse Network.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// Motion vector from device accelerometer
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -53,16 +54,16 @@ impl Heartbeat {
         ALPHA * hr_norm + BETA * motion_norm + GAMMA * continuity
     }
     
-    /// Get the signable portion of the heartbeat (excludes signature)
+    /// Get the signable portion of the heartbeat (excludes signature).
+    /// Uses sorted keys for cross-platform compatibility (iOS, Android, Web).
     pub fn signable_bytes(&self) -> Vec<u8> {
-        let signable = serde_json::json!({
-            "timestamp": self.timestamp,
-            "heart_rate": self.heart_rate,
-            "motion": self.motion,
-            "temperature": self.temperature,
-            "device_pubkey": self.device_pubkey,
-        });
-        serde_json::to_vec(&signable).unwrap()
+        let mut map = BTreeMap::new();
+        map.insert("device_pubkey", serde_json::to_value(&self.device_pubkey).unwrap());
+        map.insert("heart_rate", serde_json::to_value(self.heart_rate).unwrap());
+        map.insert("motion", serde_json::to_value(&self.motion).unwrap());
+        map.insert("temperature", serde_json::to_value(self.temperature).unwrap());
+        map.insert("timestamp", serde_json::to_value(self.timestamp).unwrap());
+        serde_json::to_vec(&map).unwrap()
     }
 }
 
@@ -87,16 +88,17 @@ pub struct Transaction {
 }
 
 impl Transaction {
+    /// Get the signable portion of the transaction (excludes signature).
+    /// Uses sorted keys for cross-platform compatibility.
     pub fn signable_bytes(&self) -> Vec<u8> {
-        let signable = serde_json::json!({
-            "tx_id": self.tx_id,
-            "sender_pubkey": self.sender_pubkey,
-            "recipient_pubkey": self.recipient_pubkey,
-            "amount": self.amount,
-            "timestamp": self.timestamp,
-            "heartbeat_signature": self.heartbeat_signature,
-        });
-        serde_json::to_vec(&signable).unwrap()
+        let mut map = BTreeMap::new();
+        map.insert("amount", serde_json::to_value(self.amount).unwrap());
+        map.insert("heartbeat_signature", serde_json::to_value(&self.heartbeat_signature).unwrap());
+        map.insert("recipient_pubkey", serde_json::to_value(&self.recipient_pubkey).unwrap());
+        map.insert("sender_pubkey", serde_json::to_value(&self.sender_pubkey).unwrap());
+        map.insert("timestamp", serde_json::to_value(self.timestamp).unwrap());
+        map.insert("tx_id", serde_json::to_value(&self.tx_id).unwrap());
+        serde_json::to_vec(&map).unwrap()
     }
 }
 
