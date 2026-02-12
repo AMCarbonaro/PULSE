@@ -36,22 +36,58 @@ pub struct Heartbeat {
 }
 
 impl Heartbeat {
-    /// Calculate weighted contribution W_i = α·HR + β·||M|| + γ·continuity
-    pub fn weight(&self) -> f64 {
+    /// Calculate weighted contribution W_i = α·HR_norm + β·M_norm + γ·continuity
+    /// 
+    /// All components are normalized to [0, 1] range to prevent any single
+    /// biometric from dominating. This is critical for fair reward distribution
+    /// and preventing gaming (e.g., exercising to inflate weight).
+    ///
+    /// The continuity factor requires external state (how long this device has
+    /// been continuously pulsing), so it's passed as a parameter.
+    pub fn weight_with_continuity(&self, continuity_factor: f64) -> f64 {
         const ALPHA: f64 = 0.4;  // Heart rate weight
-        const BETA: f64 = 0.4;   // Motion weight  
-        const GAMMA: f64 = 0.2;  // Continuity weight
+        const BETA: f64 = 0.3;   // Motion weight  
+        const GAMMA: f64 = 0.3;  // Continuity weight
         
-        // Normalize heart rate around resting (70 BPM)
-        let hr_norm = self.heart_rate as f64 / 70.0;
+        // Normalize heart rate to [0, 1] using sigmoid-like mapping:
+        // - 30 BPM (minimum valid) → ~0.0
+        // - 70 BPM (resting) → ~0.5
+        // - 120 BPM (moderate exercise) → ~0.8
+        // - 220 BPM (max valid) → ~1.0
+        // This prevents extreme HR from giving disproportionate advantage
+        let hr_norm = Self::normalize_heart_rate(self.heart_rate);
         
-        // Normalize motion magnitude
-        let motion_norm = (self.motion.magnitude() / 0.5).min(2.0);
+        // Normalize motion magnitude to [0, 1]:
+        // - 0.0 g (stationary) → 0.0
+        // - 0.5 g (walking) → ~0.5
+        // - 2.0+ g (running/vigorous) → 1.0
+        // Capped to prevent accelerometer spoofing from being profitable
+        let motion_norm = (self.motion.magnitude() / 2.0).min(1.0);
         
-        // Continuity factor (placeholder - would track gaps)
-        let continuity = 1.0;
+        // Continuity: [0, 1] — how long this device has been continuously pulsing
+        // 0.0 = just joined, 1.0 = pulsing for full window (e.g., 5+ minutes)
+        let cont_norm = continuity_factor.clamp(0.0, 1.0);
         
-        ALPHA * hr_norm + BETA * motion_norm + GAMMA * continuity
+        ALPHA * hr_norm + BETA * motion_norm + GAMMA * cont_norm
+    }
+    
+    /// Backward-compatible weight (assumes full continuity)
+    pub fn weight(&self) -> f64 {
+        self.weight_with_continuity(1.0)
+    }
+    
+    /// Sigmoid-like normalization for heart rate to [0, 1].
+    /// Uses a logistic curve centered at 100 BPM (midpoint of valid range).
+    /// This ensures:
+    ///  - Resting HR (~60-70) gives moderate weight
+    ///  - Active HR (~100-150) gives higher weight  
+    ///  - Extreme HR (>180) plateaus — no incentive to game via overexertion
+    fn normalize_heart_rate(hr: u16) -> f64 {
+        let hr = hr as f64;
+        // Logistic: 1 / (1 + e^(-k*(x - midpoint)))
+        // k=0.04 gives a gentle S-curve across 30-220 BPM range
+        // midpoint=100 centers the curve
+        1.0 / (1.0 + (-0.04 * (hr - 100.0)).exp())
     }
     
     /// Get the signable portion of the heartbeat (excludes signature).
@@ -139,6 +175,7 @@ impl PulseBlock {
             "transactions": self.transactions,
             "n_live": self.n_live,
             "total_weight": self.total_weight,
+            "security": self.security,
         });
         
         let bytes = serde_json::to_vec(&data).unwrap();

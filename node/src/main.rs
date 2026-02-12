@@ -21,6 +21,7 @@ use tracing_subscriber::FmtSubscriber;
 use pulse_node::{
     api::{self, AppState},
     api::websocket::WsEvent,
+    api::events::NodeEvent,
     consensus::{ConsensusConfig, ProofOfLife},
     crypto::Keypair,
     storage::Storage,
@@ -166,14 +167,29 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn run_node(state: AppState, config: &Config) -> anyhow::Result<()> {
-    // Start API server (returns broadcaster for block loop)
+    // Start API server (returns broadcaster + event log for block loop)
     let addr = format!("0.0.0.0:{}", config.api_port);
-    let broadcaster = api::start_server(state.clone(), &addr).await?;
+    let handles = api::start_server(state.clone(), &addr).await?;
+    let broadcaster = handles.broadcaster;
+    let event_log = handles.event_log;
     
-    // Spawn block production loop with WebSocket broadcasting
+    // Log node start event
+    {
+        let pol = state.read().await;
+        event_log.push(NodeEvent::NodeStarted {
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).unwrap()
+                .as_millis() as u64,
+            version: api::NODE_VERSION.to_string(),
+            chain_height: pol.chain_height(),
+        }).await;
+    }
+    
+    // Spawn block production loop with WebSocket broadcasting + event logging
     let block_state = state.clone();
     let block_interval = config.block_interval_ms;
     let block_broadcaster = broadcaster.clone();
+    let block_event_log = event_log.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_millis(block_interval));
         loop {
@@ -188,6 +204,27 @@ async fn run_node(state: AppState, config: &Config) -> anyhow::Result<()> {
             }
             
             if let Ok(Some(block)) = pol.try_create_block() {
+                // Log block event
+                block_event_log.push(NodeEvent::BlockCreated {
+                    timestamp: block.timestamp,
+                    index: block.index,
+                    block_hash: block.block_hash.clone(),
+                    n_live: block.n_live,
+                    total_weight: block.total_weight,
+                    security: block.security,
+                    rewards_distributed: 100.0, // reward_per_block
+                }).await;
+                
+                // Log each heartbeat in the block
+                for hb in &block.heartbeats {
+                    block_event_log.push(NodeEvent::HeartbeatReceived {
+                        timestamp: hb.timestamp,
+                        device_pubkey: hb.device_pubkey[..16].to_string() + "...",
+                        heart_rate: hb.heart_rate,
+                        weight: hb.weight(),
+                    }).await;
+                }
+                
                 // Broadcast new block to WebSocket clients
                 block_broadcaster.broadcast(WsEvent::NewBlock { block });
                 

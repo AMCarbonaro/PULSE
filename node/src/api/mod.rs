@@ -3,6 +3,7 @@
 
 pub mod rate_limit;
 pub mod websocket;
+pub mod events;
 
 use axum::{
     extract::{ConnectInfo, Path, Query, State, Json},
@@ -23,6 +24,7 @@ use crate::consensus::ProofOfLife;
 use crate::types::{Account, Heartbeat, Transaction};
 use rate_limit::{RateLimiter, RateLimitConfig};
 pub use websocket::WsBroadcaster;
+pub use events::EventLog;
 
 /// Shared application state
 pub type AppState = Arc<RwLock<ProofOfLife>>;
@@ -34,7 +36,11 @@ pub struct ApiState {
     pub pulse_limiter: RateLimiter,   // Strict: heartbeat submissions
     pub query_limiter: RateLimiter,   // Lenient: read queries
     pub ws_broadcaster: Arc<WsBroadcaster>,
+    pub event_log: EventLog,
 }
+
+/// Node version info
+pub const NODE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Pagination query parameters
 #[derive(Deserialize)]
@@ -65,10 +71,10 @@ impl ApiResponse<()> {
     }
 }
 
-/// Create the API router, returning both the Router and the WsBroadcaster
-/// so the block production loop can broadcast events.
-pub fn create_router(state: AppState) -> (Router, Arc<WsBroadcaster>) {
+/// Create the API router, returning the Router plus handles for the block loop.
+pub fn create_router(state: AppState) -> (Router, Arc<WsBroadcaster>, EventLog) {
     let ws_broadcaster = Arc::new(WsBroadcaster::new(256));
+    let event_log = EventLog::new();
     
     let api_state = ApiState {
         consensus: state,
@@ -81,6 +87,7 @@ pub fn create_router(state: AppState) -> (Router, Arc<WsBroadcaster>) {
             window: Duration::from_secs(60),
         }),
         ws_broadcaster: ws_broadcaster.clone(),
+        event_log: event_log.clone(),
     };
 
     // Spawn rate limiter cleanup task
@@ -109,13 +116,16 @@ pub fn create_router(state: AppState) -> (Router, Arc<WsBroadcaster>) {
         .route("/blocks", get(get_blocks))
         .route("/block/:index", get(get_block_by_index))
         .route("/chain", get(get_chain_info))
+        // Node info & activity
+        .route("/info", get(get_node_info))
+        .route("/events", get(get_events))
         // WebSocket for live updates
         .route("/ws", get(websocket::ws_handler).with_state(ws_broadcaster.clone()))
         // Add CORS for device access
         .layer(CorsLayer::permissive())
         .with_state(api_state);
 
-    (router, ws_broadcaster)
+    (router, ws_broadcaster, event_log)
 }
 
 /// Health check endpoint
@@ -422,20 +432,83 @@ async fn get_chain_info(
     Json(ApiResponse::ok(info)).into_response()
 }
 
-/// Start the API server, returning the WsBroadcaster for the block loop to use
-pub async fn start_server(state: AppState, addr: &str) -> anyhow::Result<Arc<WsBroadcaster>> {
-    let (router, broadcaster) = create_router(state);
+/// Get node info / version
+async fn get_node_info(
+    State(state): State<ApiState>,
+) -> impl IntoResponse {
+    let pol = state.consensus.read().await;
+    
+    #[derive(Serialize)]
+    struct NodeInfo {
+        version: String,
+        chain_height: u64,
+        active_accounts: usize,
+        heartbeat_pool_size: usize,
+        ws_clients: usize,
+        uptime_info: String,
+    }
+    
+    Json(ApiResponse::ok(NodeInfo {
+        version: NODE_VERSION.to_string(),
+        chain_height: pol.chain_height(),
+        active_accounts: pol.get_accounts().len(),
+        heartbeat_pool_size: pol.heartbeat_pool_size(),
+        ws_clients: state.ws_broadcaster.subscriber_count(),
+        uptime_info: "running".to_string(),
+    })).into_response()
+}
+
+/// Query parameters for events endpoint
+#[derive(Deserialize)]
+pub struct EventParams {
+    pub limit: Option<usize>,
+    pub since: Option<u64>,
+}
+
+/// Get recent events (activity feed)
+async fn get_events(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<ApiState>,
+    Query(params): Query<EventParams>,
+) -> impl IntoResponse {
+    let ip = addr.ip().to_string();
+    if !state.query_limiter.check(&ip).await {
+        return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({
+            "success": false,
+            "error": "Rate limit exceeded"
+        }))).into_response();
+    }
+
+    let events = if let Some(since) = params.since {
+        state.event_log.since(since).await
+    } else {
+        state.event_log.latest(params.limit.unwrap_or(50).min(200)).await
+    };
+
+    Json(ApiResponse::ok(events)).into_response()
+}
+
+/// Return type for start_server — both broadcaster and event log
+pub struct ServerHandles {
+    pub broadcaster: Arc<WsBroadcaster>,
+    pub event_log: EventLog,
+}
+
+/// Start the API server, returning handles for the block loop to use
+pub async fn start_server(state: AppState, addr: &str) -> anyhow::Result<ServerHandles> {
+    let (router, broadcaster, event_log) = create_router(state);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     
     info!("🌐 API server listening on {}", addr);
     info!("🔌 WebSocket endpoint: ws://{}/ws", addr);
     
     let bc = broadcaster.clone();
+    let el = event_log.clone();
     tokio::spawn(async move {
         axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>())
             .await
             .unwrap();
     });
     
-    Ok(bc)
+    Ok(ServerHandles { broadcaster: bc, event_log: el })
 }

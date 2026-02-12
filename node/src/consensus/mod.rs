@@ -73,6 +73,14 @@ pub struct ProofOfLife {
     total_minted: f64,
     /// Persistent storage (optional — None means in-memory only)
     storage: Option<Arc<Storage>>,
+    /// Tracks when each device first started pulsing in current session (pubkey -> timestamp_ms)
+    /// Used for continuity factor (γ·Δt_i)
+    continuity_start: HashMap<String, u64>,
+    /// Tracks last seen heartbeat hash per pubkey to prevent duplicate submissions
+    last_heartbeat_hash: HashMap<String, String>,
+    /// Cumulative chain weight (sum of all block security values)
+    /// Used for fork resolution: heaviest chain wins
+    cumulative_weight: f64,
 }
 
 impl ProofOfLife {
@@ -89,6 +97,9 @@ impl ProofOfLife {
             accounts: HashMap::new(),
             total_minted: 0.0,
             storage: None,
+            continuity_start: HashMap::new(),
+            last_heartbeat_hash: HashMap::new(),
+            cumulative_weight: 0.0,
         }
     }
 
@@ -116,7 +127,11 @@ impl ProofOfLife {
             info!("   Chain height: {}", chain_height);
             info!("   Blocks: {}", stored_blocks.len());
             info!("   Accounts: {}", accounts.len());
+            // Calculate cumulative chain weight from stored blocks
+            let cumulative_weight: f64 = stored_blocks.iter().map(|b| b.security).sum();
+            
             info!("   Total minted: {:.4} PULSE", total_minted);
+            info!("   Cumulative weight: {:.4}", cumulative_weight);
             
             Ok(Self {
                 config,
@@ -126,6 +141,9 @@ impl ProofOfLife {
                 accounts,
                 total_minted,
                 storage: Some(storage),
+                continuity_start: HashMap::new(),
+                last_heartbeat_hash: HashMap::new(),
+                cumulative_weight,
             })
         } else {
             // Fresh start with genesis
@@ -148,6 +166,9 @@ impl ProofOfLife {
                 accounts: HashMap::new(),
                 total_minted: 0.0,
                 storage: Some(storage),
+                continuity_start: HashMap::new(),
+                last_heartbeat_hash: HashMap::new(),
+                cumulative_weight: 0.0,
             })
         }
     }
@@ -221,7 +242,23 @@ impl ProofOfLife {
             return Err(ConsensusError::InvalidHeartRate(hb.heart_rate));
         }
         
-        // 4. Add to pool (update if already present)
+        // 4. Duplicate check — reject identical heartbeat data resubmission
+        let hb_hash = crate::crypto::hash_sha256(&hb.signable_bytes());
+        if let Some(last_hash) = self.last_heartbeat_hash.get(&hb.device_pubkey) {
+            if *last_hash == hb_hash {
+                warn!("❌ Duplicate heartbeat from {}...", &hb.device_pubkey[..8]);
+                return Err(ConsensusError::StaleHeartbeat);
+            }
+        }
+        self.last_heartbeat_hash.insert(hb.device_pubkey.clone(), hb_hash);
+        
+        // 5. Track continuity — record when this device first started pulsing
+        let now = current_time_ms();
+        self.continuity_start
+            .entry(hb.device_pubkey.clone())
+            .or_insert(now);
+        
+        // 6. Add to pool (update if already present)
         debug!("✅ Heartbeat verified: {}... HR={} W={:.3}", 
             &hb.device_pubkey[..8], hb.heart_rate, hb.weight());
         self.heartbeat_pool.insert(hb.device_pubkey.clone(), hb);
@@ -274,11 +311,43 @@ impl ProofOfLife {
             return Ok(None);
         }
         
-        // Calculate metrics
+        // Calculate metrics with proper continuity factors
+        let now = current_time_ms();
         let heartbeats: Vec<Heartbeat> = self.heartbeat_pool.values().cloned().collect();
-        let total_weight: f64 = heartbeats.iter().map(|h| h.weight()).sum();
+        
+        // Calculate continuity-weighted contributions
+        // Continuity factor: time pulsing / max_continuity_window (5 minutes)
+        const MAX_CONTINUITY_MS: f64 = 300_000.0; // 5 minutes for full continuity credit
+        
+        // Pre-compute weights with continuity so we use the SAME values
+        // for both total_weight and per-participant rewards (mathematical consistency)
+        let weighted_heartbeats: Vec<(Heartbeat, f64)> = heartbeats.iter().map(|h| {
+            let start = self.continuity_start
+                .get(&h.device_pubkey)
+                .copied()
+                .unwrap_or(now);
+            let duration_ms = now.saturating_sub(start) as f64;
+            let continuity = (duration_ms / MAX_CONTINUITY_MS).min(1.0);
+            let w = h.weight_with_continuity(continuity);
+            (h.clone(), w)
+        }).collect();
+        
+        let total_weight: f64 = weighted_heartbeats.iter().map(|(_, w)| w).sum();
+        
         let security = total_weight;
-        let fork_prob = (-self.config.fork_constant * security).exp();
+        
+        // Adaptive fork constant: scales with network size
+        // Small network (1-10 participants): k=2.0 (need strong per-participant security)
+        // Medium (10-100): k=0.5
+        // Large (100+): k=0.1
+        // Global (1M+): k=0.000001
+        // Formula: k = base_k / ln(1 + n_live), clamped
+        let adaptive_k = if n_live <= 1 {
+            2.0
+        } else {
+            (self.config.fork_constant / (1.0 + n_live as f64).ln()).max(0.000001)
+        };
+        let fork_prob = (-adaptive_k * security).exp();
         
         // Create block
         let previous = self.chain.last().unwrap();
@@ -305,10 +374,10 @@ impl ProofOfLife {
         // Track affected accounts for persistence
         let mut affected_pubkeys: Vec<String> = Vec::new();
         
-        // Distribute rewards
+        // Distribute rewards using the SAME pre-computed weights
         if total_weight > 0.0 {
-            for hb in &heartbeats {
-                let reward = (hb.weight() / total_weight) * self.config.reward_per_block;
+            for (hb, w_i) in &weighted_heartbeats {
+                let reward = (w_i / total_weight) * self.config.reward_per_block;
                 
                 let account = self.accounts
                     .entry(hb.device_pubkey.clone())
@@ -352,12 +421,19 @@ impl ProofOfLife {
         // Commit block to chain
         self.chain.push(block.clone());
         
+        // Update cumulative chain weight (for fork resolution)
+        self.cumulative_weight += security;
+        
         // Persist to storage
         self.persist_block(&block, &affected_pubkeys);
         
-        // Clear pools
+        // Clear pools (but keep continuity tracking for devices that keep pulsing)
         self.heartbeat_pool.clear();
         self.tx_pool.clear();
+        
+        // Note: continuity_start is NOT cleared — devices that keep pulsing
+        // accumulate continuity across blocks. Entries are cleaned up when
+        // a device stops sending heartbeats (via periodic cleanup, not here).
         
         Ok(Some(block))
     }
@@ -413,6 +489,29 @@ impl ProofOfLife {
     pub fn is_pulsing(&self, pubkey: &str) -> bool {
         self.heartbeat_pool.contains_key(pubkey)
     }
+    
+    /// Get cumulative chain weight (for fork resolution: heaviest chain wins)
+    pub fn cumulative_chain_weight(&self) -> f64 {
+        self.cumulative_weight
+    }
+    
+    /// Clean up continuity tracking for devices that haven't pulsed recently.
+    /// Call this periodically (e.g., every few block intervals).
+    pub fn cleanup_stale_continuity(&mut self) {
+        let now = current_time_ms();
+        let max_age = self.config.max_heartbeat_age_ms * 2; // 2x heartbeat timeout
+        
+        self.continuity_start.retain(|pubkey, start| {
+            let age = now.saturating_sub(*start);
+            // Keep if device pulsed recently or started recently
+            self.heartbeat_pool.contains_key(pubkey) || age < max_age
+        });
+        
+        // Also clean up stale heartbeat hashes
+        self.last_heartbeat_hash.retain(|pubkey, _| {
+            self.continuity_start.contains_key(pubkey)
+        });
+    }
 }
 
 /// Get current time in milliseconds
@@ -463,6 +562,136 @@ mod tests {
         
         assert!(block.is_some());
         assert_eq!(pol.chain_height(), 1);
+    }
+
+    #[test]
+    fn test_weight_normalization() {
+        // Verify that weight function outputs are in reasonable [0, 1] range
+        let kp = Keypair::generate();
+        
+        // Resting person: HR=70, minimal motion
+        let mut hb_rest = create_test_heartbeat(&kp);
+        hb_rest.heart_rate = 70;
+        hb_rest.motion = Motion { x: 0.01, y: 0.01, z: 0.01 };
+        let w_rest = hb_rest.weight_with_continuity(1.0);
+        
+        // Active person: HR=150, walking
+        let mut hb_active = create_test_heartbeat(&kp);
+        hb_active.heart_rate = 150;
+        hb_active.motion = Motion { x: 0.3, y: 0.2, z: 0.1 };
+        let w_active = hb_active.weight_with_continuity(1.0);
+        
+        // Extreme: HR=200, running hard
+        let mut hb_extreme = create_test_heartbeat(&kp);
+        hb_extreme.heart_rate = 200;
+        hb_extreme.motion = Motion { x: 1.5, y: 1.0, z: 0.5 };
+        let w_extreme = hb_extreme.weight_with_continuity(1.0);
+        
+        // All weights should be in [0, 1] range
+        assert!(w_rest > 0.0 && w_rest <= 1.0, "Rest weight out of range: {}", w_rest);
+        assert!(w_active > 0.0 && w_active <= 1.0, "Active weight out of range: {}", w_active);
+        assert!(w_extreme > 0.0 && w_extreme <= 1.0, "Extreme weight out of range: {}", w_extreme);
+        
+        // Active should be higher than resting
+        assert!(w_active > w_rest, "Active ({}) should > rest ({})", w_active, w_rest);
+        
+        // But extreme shouldn't be MUCH higher than active (sigmoid plateau)
+        let extreme_ratio = w_extreme / w_active;
+        assert!(extreme_ratio < 1.5, "Extreme/active ratio too high: {}", extreme_ratio);
+        
+        println!("Weight rest={:.4} active={:.4} extreme={:.4} ratio={:.2}", 
+            w_rest, w_active, w_extreme, extreme_ratio);
+    }
+    
+    #[test]
+    fn test_continuity_affects_weight() {
+        let kp = Keypair::generate();
+        let hb = create_test_heartbeat(&kp);
+        
+        // No continuity vs full continuity
+        let w_zero = hb.weight_with_continuity(0.0);
+        let w_full = hb.weight_with_continuity(1.0);
+        
+        assert!(w_full > w_zero, "Full continuity ({}) should > zero ({})", w_full, w_zero);
+        
+        // The difference should be exactly gamma * 1.0 = 0.3
+        let diff = w_full - w_zero;
+        assert!((diff - 0.3).abs() < 0.001, "Continuity diff should be ~0.3, got {}", diff);
+    }
+    
+    #[test]
+    fn test_reward_distribution_proportional() {
+        let mut pol = ProofOfLife::new(ConsensusConfig::default());
+        
+        // Two devices with different activity levels
+        let kp1 = Keypair::generate();
+        let kp2 = Keypair::generate();
+        
+        let mut hb1 = create_test_heartbeat(&kp1);
+        hb1.heart_rate = 70; // resting
+        hb1.motion = Motion { x: 0.01, y: 0.01, z: 0.01 };
+        hb1.signature = kp1.sign(&hb1.signable_bytes());
+        
+        let mut hb2 = create_test_heartbeat(&kp2);
+        hb2.heart_rate = 140; // active
+        hb2.motion = Motion { x: 0.5, y: 0.3, z: 0.2 };
+        hb2.signature = kp2.sign(&hb2.signable_bytes());
+        
+        pol.receive_heartbeat(hb1).unwrap();
+        pol.receive_heartbeat(hb2).unwrap();
+        pol.try_create_block().unwrap();
+        
+        let bal1 = pol.get_balance(&kp1.public_key_hex());
+        let bal2 = pol.get_balance(&kp2.public_key_hex());
+        
+        // Total should be reward_per_block (100.0)
+        assert!((bal1 + bal2 - 100.0).abs() < 0.001, 
+            "Total rewards should be 100, got {}", bal1 + bal2);
+        
+        // Active person should earn more than resting
+        assert!(bal2 > bal1, "Active ({}) should earn more than rest ({})", bal2, bal1);
+        
+        println!("Rewards: rest={:.4} active={:.4}", bal1, bal2);
+    }
+    
+    #[test]
+    fn test_duplicate_heartbeat_rejected() {
+        let mut pol = ProofOfLife::new(ConsensusConfig::default());
+        let kp = Keypair::generate();
+        let hb = create_test_heartbeat(&kp);
+        
+        // First submission should succeed
+        assert!(pol.receive_heartbeat(hb.clone()).is_ok());
+        
+        // Exact same heartbeat (same data) should be rejected as duplicate
+        assert!(pol.receive_heartbeat(hb).is_err());
+    }
+    
+    #[test]
+    fn test_cumulative_chain_weight() {
+        let mut pol = ProofOfLife::new(ConsensusConfig::default());
+        
+        assert_eq!(pol.cumulative_chain_weight(), 0.0);
+        
+        let kp = Keypair::generate();
+        
+        // Create first block
+        let hb1 = create_test_heartbeat(&kp);
+        pol.receive_heartbeat(hb1).unwrap();
+        pol.try_create_block().unwrap();
+        let weight_after_1 = pol.cumulative_chain_weight();
+        assert!(weight_after_1 > 0.0, "Cumulative weight should be > 0 after first block");
+        
+        // Create second block (need fresh heartbeat with different timestamp)
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let hb2 = create_test_heartbeat(&kp);
+        pol.receive_heartbeat(hb2).unwrap();
+        pol.try_create_block().unwrap();
+        let weight_after_2 = pol.cumulative_chain_weight();
+        
+        // Cumulative should grow
+        assert!(weight_after_2 > weight_after_1, 
+            "Cumulative weight should grow: {} > {}", weight_after_2, weight_after_1);
     }
 
     #[test]
