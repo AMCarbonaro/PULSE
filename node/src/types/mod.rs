@@ -157,6 +157,10 @@ pub struct PulseBlock {
     pub total_weight: f64,
     /// Network security metric (S = Σ W_i)
     pub security: f64,
+    /// Biometric entropy hash — derived from HRV and sensor variability
+    /// Provides non-deterministic randomness for the network
+    #[serde(default)]
+    pub bio_entropy: String,
     /// Block hash
     #[serde(default)]
     pub block_hash: String,
@@ -176,6 +180,7 @@ impl PulseBlock {
             "n_live": self.n_live,
             "total_weight": self.total_weight,
             "security": self.security,
+            "bio_entropy": self.bio_entropy,
         });
         
         let bytes = serde_json::to_vec(&data).unwrap();
@@ -198,6 +203,14 @@ pub struct NetworkStats {
     pub current_tps: f64,
     pub avg_block_time: f64,
     pub total_security: f64,
+    /// Current block reward (after halvings)
+    pub current_block_reward: f64,
+    /// Current halving epoch
+    pub halving_epoch: u64,
+    /// Cumulative chain weight (for fork resolution)
+    pub cumulative_weight: f64,
+    /// Inflation rate: tokens_per_block / total_supply
+    pub inflation_rate: f64,
 }
 
 /// Account balance and state

@@ -1,8 +1,11 @@
 //! Proof-of-Life consensus engine for the Pulse Network.
 
+pub mod biometrics;
+
 use crate::crypto::{verify_signature, CryptoError};
 use crate::storage::Storage;
 use crate::types::{Heartbeat, PulseBlock, Transaction, Account};
+use biometrics::BiometricValidator;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -25,6 +28,8 @@ pub enum ConsensusError {
     InsufficientBalance,
     #[error("Sender not pulsing")]
     SenderNotPulsing,
+    #[error("Biometric validation failed: {0}")]
+    BiometricValidationFailed(String),
     #[error("Crypto error: {0}")]
     Crypto(#[from] CryptoError),
     #[error("Storage error: {0}")]
@@ -38,12 +43,19 @@ pub struct ConsensusConfig {
     pub n_threshold: usize,
     /// Block interval in milliseconds
     pub block_interval_ms: u64,
-    /// Base reward per block
-    pub reward_per_block: f64,
+    /// Initial base reward per block (before halving)
+    pub initial_reward_per_block: f64,
     /// Maximum heartbeat age in milliseconds
     pub max_heartbeat_age_ms: u64,
     /// Fork probability constant (k)
     pub fork_constant: f64,
+    /// Halving interval: reward halves every N blocks
+    /// Models biological constraint — as network matures, new supply slows
+    pub halving_interval: u64,
+    /// Minimum reward per block (floor — never goes below this)
+    pub min_reward_per_block: f64,
+    /// Smoothing window: average inflation over last N blocks to prevent spikes
+    pub inflation_smoothing_window: usize,
 }
 
 impl Default for ConsensusConfig {
@@ -51,10 +63,33 @@ impl Default for ConsensusConfig {
         Self {
             n_threshold: 1,
             block_interval_ms: 5000,
-            reward_per_block: 100.0,
+            initial_reward_per_block: 100.0,
             max_heartbeat_age_ms: 30000,
             fork_constant: 0.5,
+            // Halving every 210,000 blocks (~12 days at 5s intervals)
+            // Inspired by Bitcoin's model but on a faster cycle since blocks are faster
+            halving_interval: 210_000,
+            min_reward_per_block: 0.01,
+            inflation_smoothing_window: 100,
         }
+    }
+}
+
+impl ConsensusConfig {
+    /// Calculate the block reward at a given block height, applying halvings.
+    /// R(h) = initial_reward / 2^(h / halving_interval)
+    /// Clamped to min_reward_per_block.
+    pub fn reward_at_height(&self, block_height: u64) -> f64 {
+        if self.halving_interval == 0 {
+            return self.initial_reward_per_block;
+        }
+        let halvings = block_height / self.halving_interval;
+        // After 64 halvings the reward is effectively 0
+        if halvings >= 64 {
+            return self.min_reward_per_block;
+        }
+        let reward = self.initial_reward_per_block / (2u64.pow(halvings as u32) as f64);
+        reward.max(self.min_reward_per_block)
     }
 }
 
@@ -81,6 +116,8 @@ pub struct ProofOfLife {
     /// Cumulative chain weight (sum of all block security values)
     /// Used for fork resolution: heaviest chain wins
     cumulative_weight: f64,
+    /// Biometric validator for sensor spoofing detection
+    biometric_validator: BiometricValidator,
 }
 
 impl ProofOfLife {
@@ -100,6 +137,7 @@ impl ProofOfLife {
             continuity_start: HashMap::new(),
             last_heartbeat_hash: HashMap::new(),
             cumulative_weight: 0.0,
+            biometric_validator: BiometricValidator::new(),
         }
     }
 
@@ -144,6 +182,7 @@ impl ProofOfLife {
                 continuity_start: HashMap::new(),
                 last_heartbeat_hash: HashMap::new(),
                 cumulative_weight,
+                biometric_validator: BiometricValidator::new(),
             })
         } else {
             // Fresh start with genesis
@@ -169,6 +208,7 @@ impl ProofOfLife {
                 continuity_start: HashMap::new(),
                 last_heartbeat_hash: HashMap::new(),
                 cumulative_weight: 0.0,
+            biometric_validator: BiometricValidator::new(),
             })
         }
     }
@@ -183,6 +223,7 @@ impl ProofOfLife {
             n_live: 0,
             total_weight: 0.0,
             security: 0.0,
+            bio_entropy: "0".repeat(64),
             block_hash: String::new(),
         };
         block.block_hash = block.compute_hash();
@@ -242,7 +283,22 @@ impl ProofOfLife {
             return Err(ConsensusError::InvalidHeartRate(hb.heart_rate));
         }
         
-        // 4. Duplicate check — reject identical heartbeat data resubmission
+        // 4. Biometric validation — detect synthetic/spoofed heartbeats
+        let bio_result = self.biometric_validator.validate(
+            &hb.device_pubkey,
+            hb.heart_rate,
+            hb.motion.magnitude(),
+            hb.temperature,
+        );
+        
+        if !bio_result.is_valid {
+            let reason = bio_result.reason.unwrap_or_else(|| "Unknown".to_string());
+            warn!("🚨 Biometric validation failed for {}...: {}", &hb.device_pubkey[..8], reason);
+            return Err(ConsensusError::BiometricValidationFailed(reason));
+        }
+        
+        // 5. Duplicate check — reject identical heartbeat data resubmission
+        // (renumbered after adding biometric check above)
         let hb_hash = crate::crypto::hash_sha256(&hb.signable_bytes());
         if let Some(last_hash) = self.last_heartbeat_hash.get(&hb.device_pubkey) {
             if *last_hash == hb_hash {
@@ -349,6 +405,10 @@ impl ProofOfLife {
         };
         let fork_prob = (-adaptive_k * security).exp();
         
+        // Extract biometric entropy from all active devices
+        let bio_entropy_bytes = self.biometric_validator.aggregate_entropy();
+        let bio_entropy = hex::encode(&bio_entropy_bytes);
+        
         // Create block
         let previous = self.chain.last().unwrap();
         let mut block = PulseBlock {
@@ -360,6 +420,7 @@ impl ProofOfLife {
             n_live,
             total_weight,
             security,
+            bio_entropy,
             block_hash: String::new(),
         };
         block.block_hash = block.compute_hash();
@@ -374,10 +435,16 @@ impl ProofOfLife {
         // Track affected accounts for persistence
         let mut affected_pubkeys: Vec<String> = Vec::new();
         
+        // Calculate block reward with halving schedule
+        let block_reward = self.config.reward_at_height(block.index);
+        
+        info!("   Block reward: {:.4} PULSE (halving epoch {})", 
+            block_reward, block.index / self.config.halving_interval.max(1));
+        
         // Distribute rewards using the SAME pre-computed weights
         if total_weight > 0.0 {
             for (hb, w_i) in &weighted_heartbeats {
-                let reward = (w_i / total_weight) * self.config.reward_per_block;
+                let reward = (w_i / total_weight) * block_reward;
                 
                 let account = self.accounts
                     .entry(hb.device_pubkey.clone())
@@ -470,6 +537,19 @@ impl ProofOfLife {
     
     /// Get network stats
     pub fn get_stats(&self) -> crate::types::NetworkStats {
+        let height = self.chain_height();
+        let current_reward = self.config.reward_at_height(height);
+        let halving_epoch = if self.config.halving_interval > 0 {
+            height / self.config.halving_interval
+        } else {
+            0
+        };
+        let inflation_rate = if self.total_minted > 0.0 {
+            current_reward / self.total_minted
+        } else {
+            0.0
+        };
+        
         crate::types::NetworkStats {
             chain_length: self.chain.len() as u64,
             total_minted: self.total_minted,
@@ -477,6 +557,10 @@ impl ProofOfLife {
             current_tps: 0.0, // TODO: calculate from recent blocks
             avg_block_time: self.config.block_interval_ms as f64 / 1000.0,
             total_security: self.chain.iter().map(|b| b.security).sum(),
+            current_block_reward: current_reward,
+            halving_epoch,
+            cumulative_weight: self.cumulative_weight,
+            inflation_rate,
         }
     }
     
@@ -692,6 +776,43 @@ mod tests {
         // Cumulative should grow
         assert!(weight_after_2 > weight_after_1, 
             "Cumulative weight should grow: {} > {}", weight_after_2, weight_after_1);
+    }
+
+    #[test]
+    fn test_halving_schedule() {
+        let config = ConsensusConfig::default();
+        
+        // Block 0: full reward
+        let r0 = config.reward_at_height(0);
+        assert_eq!(r0, 100.0);
+        
+        // Block at first halving: half reward
+        let r1 = config.reward_at_height(config.halving_interval);
+        assert!((r1 - 50.0).abs() < 0.001, "First halving should give 50, got {}", r1);
+        
+        // Block at second halving: quarter reward
+        let r2 = config.reward_at_height(config.halving_interval * 2);
+        assert!((r2 - 25.0).abs() < 0.001, "Second halving should give 25, got {}", r2);
+        
+        // Block at third halving
+        let r3 = config.reward_at_height(config.halving_interval * 3);
+        assert!((r3 - 12.5).abs() < 0.001, "Third halving should give 12.5, got {}", r3);
+        
+        // Very far in the future: should hit minimum
+        let r_far = config.reward_at_height(config.halving_interval * 100);
+        assert_eq!(r_far, config.min_reward_per_block);
+    }
+    
+    #[test]
+    fn test_inflation_decreases_over_time() {
+        let config = ConsensusConfig::default();
+        
+        // Inflation at height 0 vs height 210_000 — should decrease
+        let r_early = config.reward_at_height(1000);
+        let r_later = config.reward_at_height(config.halving_interval + 1000);
+        
+        assert!(r_early > r_later, 
+            "Later reward ({}) should be less than early ({})", r_later, r_early);
     }
 
     #[test]

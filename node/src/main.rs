@@ -132,7 +132,7 @@ async fn main() -> anyhow::Result<()> {
     let consensus_config = ConsensusConfig {
         n_threshold: config.n_threshold,
         block_interval_ms: config.block_interval_ms,
-        reward_per_block: config.reward_per_block,
+        initial_reward_per_block: config.reward_per_block,
         ..Default::default()
     };
 

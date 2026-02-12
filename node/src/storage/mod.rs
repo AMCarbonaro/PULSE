@@ -143,6 +143,7 @@ mod tests {
             n_live: 0,
             total_weight: 0.0,
             security: 0.0,
+            bio_entropy: "0".repeat(64),
             block_hash: "xyz".to_string(),
         };
         
