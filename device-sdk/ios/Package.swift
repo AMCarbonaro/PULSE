@@ -14,14 +14,14 @@ let package = Package(
         ),
     ],
     dependencies: [
-        // Crypto for signing
-        .package(url: "https://github.com/apple/swift-crypto.git", from: "3.0.0"),
+        // secp256k1 for signing (matches node's k256 crate)
+        .package(url: "https://github.com/GigaBitcoin/secp256k1.swift.git", exact: "0.17.0"),
     ],
     targets: [
         .target(
             name: "PulseSDK",
             dependencies: [
-                .product(name: "Crypto", package: "swift-crypto"),
+                .product(name: "secp256k1", package: "secp256k1.swift"),
             ],
             path: "Sources"
         ),

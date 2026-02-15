@@ -1,39 +1,47 @@
 import Foundation
-import Crypto
+import secp256k1
 
-/// Manages device identity and cryptographic operations
+/// Manages device identity and cryptographic operations using secp256k1
+/// (compatible with the Pulse node's k256/ECDSA signatures)
 public class PulseIdentity {
     
-    private let privateKey: P256.Signing.PrivateKey
-    public let publicKey: P256.Signing.PublicKey
+    private let privateKey: secp256k1.Signing.PrivateKey
+    public let publicKey: secp256k1.Signing.PublicKey
     
-    /// Public key as hex string (for network identification)
+    /// Compressed public key as hex string (33 bytes, for network identification)
     public var publicKeyHex: String {
-        publicKey.rawRepresentation.map { String(format: "%02x", $0) }.joined()
+        publicKey.dataRepresentation.map { String(format: "%02x", $0) }.joined()
     }
     
     /// Private key as hex string (for backup/restore)
     public var privateKeyHex: String {
-        privateKey.rawRepresentation.map { String(format: "%02x", $0) }.joined()
+        privateKey.dataRepresentation.map { String(format: "%02x", $0) }.joined()
     }
     
     /// Generate a new random identity
     public init() {
-        self.privateKey = P256.Signing.PrivateKey()
+        self.privateKey = try! secp256k1.Signing.PrivateKey()
         self.publicKey = privateKey.publicKey
     }
     
-    /// Restore identity from private key hex
+    /// Restore identity from private key hex (raw 32-byte scalar)
     public init(privateKeyHex: String) throws {
         let keyData = Data(hexString: privateKeyHex)
-        self.privateKey = try P256.Signing.PrivateKey(rawRepresentation: keyData)
+        self.privateKey = try secp256k1.Signing.PrivateKey(dataRepresentation: keyData)
         self.publicKey = privateKey.publicKey
     }
     
-    /// Sign data and return hex-encoded signature
+    /// Restore identity from raw private key data
+    private init(rawKeyData: Data) throws {
+        self.privateKey = try secp256k1.Signing.PrivateKey(dataRepresentation: rawKeyData)
+        self.publicKey = privateKey.publicKey
+    }
+    
+    /// Sign data with ECDSA-SHA256 and return hex-encoded compact signature (64 bytes: r‖s)
+    /// secp256k1.swift's signature(for:) hashes the message with SHA-256 internally.
     public func sign(_ data: Data) throws -> String {
         let signature = try privateKey.signature(for: data)
-        return signature.rawRepresentation.map { String(format: "%02x", $0) }.joined()
+        return signature.dataRepresentation.map { String(format: "%02x", $0) }.joined()
     }
     
     /// Sign a heartbeat packet
@@ -53,7 +61,7 @@ public class PulseIdentity {
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: Self.keychainService,
             kSecAttrAccount as String: Self.keychainAccount,
-            kSecValueData as String: privateKey.rawRepresentation
+            kSecValueData as String: privateKey.dataRepresentation
         ]
         
         // Delete existing
@@ -85,8 +93,7 @@ public class PulseIdentity {
             throw PulseError.keychainError(status)
         }
         
-        let privateKey = try P256.Signing.PrivateKey(rawRepresentation: keyData)
-        return try PulseIdentity(privateKeyHex: keyData.map { String(format: "%02x", $0) }.joined())
+        return try PulseIdentity(rawKeyData: keyData)
     }
     
     /// Get or create identity (loads from Keychain or generates new)
