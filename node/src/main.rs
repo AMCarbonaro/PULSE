@@ -229,7 +229,7 @@ async fn run_node(state: AppState, config: &Config) -> anyhow::Result<()> {
                             let stats = pol.get_stats();
                             msg_broadcaster.broadcast(WsEvent::Stats { stats });
                         }
-                        Err(crate::consensus::ConsensusError::InvalidPreviousHash) => {
+                        Err(pulse_node::consensus::ConsensusError::InvalidPreviousHash) => {
                             // We're behind — request chain sync
                             let our_height = pol.chain_height();
                             drop(pol);
@@ -306,8 +306,8 @@ async fn run_node(state: AppState, config: &Config) -> anyhow::Result<()> {
                         match reqwest::get(&url).await {
                             Ok(resp) if resp.status().is_success() => {
                                 if let Ok(body) = resp.json::<serde_json::Value>().await {
-                                    if let Some(blocks_val) = body.get("data").and_then(|d| d.get("blocks")) {
-                                        if let Ok(blocks) = serde_json::from_value::<Vec<crate::types::PulseBlock>>(blocks_val.clone()) {
+                                    if let Some(blocks_val) = body.get("data").and_then(|d: &serde_json::Value| d.get("blocks")) {
+                                        if let Ok(blocks) = serde_json::from_value::<Vec<pulse_node::types::PulseBlock>>(blocks_val.clone()) {
                                             if !blocks.is_empty() {
                                                 info!("📡 Got {} blocks from peer HTTP API", blocks.len());
                                                 let mut pol = peer_state.write().await;
