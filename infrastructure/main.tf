@@ -8,6 +8,15 @@ terraform {
       version = "~> 5.0"
     }
   }
+
+  # TODO: Initialize with `terraform init` after creating the S3 bucket and DynamoDB table
+  # backend "s3" {
+  #   bucket         = "pulse-network-tfstate"
+  #   key            = "infrastructure/terraform.tfstate"
+  #   region         = "us-east-2"
+  #   encrypt        = true
+  #   dynamodb_table = "pulse-network-tflock"
+  # }
 }
 
 provider "aws" {
@@ -97,13 +106,13 @@ resource "aws_security_group" "node" {
   description = "Security group for Pulse nodes"
   vpc_id      = aws_vpc.main.id
 
-  # SSH
-  ingress {
-    from_port   = 22
-    to_port     = 22
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]  # Restrict in production
-  }
+  # SSH disabled - use SSM instead
+  # ingress {
+  #   from_port   = 22
+  #   to_port     = 22
+  #   protocol    = "tcp"
+  #   cidr_blocks = ["0.0.0.0/0"]
+  # }
 
   # HTTPS API
   ingress {

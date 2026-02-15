@@ -1,0 +1,17 @@
+[Unit]
+Description=Pulse Network Node
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ec2-user
+ExecStart=/home/ec2-user/node/target/release/pulse-node --simulate --port 8080
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=pulse-node
+
+[Install]
+WantedBy=multi-user.target
