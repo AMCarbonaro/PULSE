@@ -153,4 +153,83 @@ mod tests {
         assert_eq!(loaded.index, block.index);
         assert_eq!(loaded.block_hash, block.block_hash);
     }
+
+    #[test]
+    fn test_block_not_found() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        assert!(storage.load_block(999).is_err());
+    }
+
+    #[test]
+    fn test_load_all_blocks_sorted() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+
+        for i in [3u64, 1, 2] {
+            let block = PulseBlock {
+                index: i, timestamp: i * 1000,
+                previous_hash: String::new(), heartbeats: vec![],
+                transactions: vec![], n_live: 0, total_weight: 0.0,
+                security: 0.0, bio_entropy: String::new(),
+                block_hash: format!("hash{}", i),
+            };
+            storage.save_block(&block).unwrap();
+        }
+
+        let blocks = storage.load_all_blocks().unwrap();
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks[0].index, 1);
+        assert_eq!(blocks[2].index, 3);
+    }
+
+    #[test]
+    fn test_account_roundtrip() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+
+        let account = Account {
+            pubkey: "abc123".to_string(),
+            balance: 42.5,
+            last_heartbeat: 1000,
+            total_earned: 100.0,
+            blocks_participated: 5,
+        };
+        storage.save_account(&account).unwrap();
+
+        let loaded = storage.load_account("abc123").unwrap().unwrap();
+        assert_eq!(loaded.pubkey, "abc123");
+        assert!((loaded.balance - 42.5).abs() < 1e-10);
+        assert_eq!(loaded.blocks_participated, 5);
+    }
+
+    #[test]
+    fn test_account_not_found() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        assert!(storage.load_account("nonexistent").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_chain_height() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        assert_eq!(storage.chain_height().unwrap(), 0);
+
+        let block = PulseBlock {
+            index: 7, timestamp: 0, previous_hash: String::new(),
+            heartbeats: vec![], transactions: vec![], n_live: 0,
+            total_weight: 0.0, security: 0.0, bio_entropy: String::new(),
+            block_hash: String::new(),
+        };
+        storage.save_block(&block).unwrap();
+        assert_eq!(storage.chain_height().unwrap(), 7);
+    }
+
+    #[test]
+    fn test_flush() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        assert!(storage.flush().is_ok());
+    }
 }

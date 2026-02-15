@@ -75,3 +75,75 @@ impl RateLimiter {
         state.retain(|_, v| now.duration_since(v.window_start) <= self.config.window * 2);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_allows_under_limit() {
+        let limiter = RateLimiter::new(RateLimitConfig {
+            max_requests: 5,
+            window: Duration::from_secs(60),
+        });
+        for _ in 0..5 {
+            assert!(limiter.check("user1").await);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_blocks_over_limit() {
+        let limiter = RateLimiter::new(RateLimitConfig {
+            max_requests: 3,
+            window: Duration::from_secs(60),
+        });
+        assert!(limiter.check("user1").await);
+        assert!(limiter.check("user1").await);
+        assert!(limiter.check("user1").await);
+        assert!(!limiter.check("user1").await);
+    }
+
+    #[tokio::test]
+    async fn test_separate_keys() {
+        let limiter = RateLimiter::new(RateLimitConfig {
+            max_requests: 1,
+            window: Duration::from_secs(60),
+        });
+        assert!(limiter.check("a").await);
+        assert!(limiter.check("b").await);
+        assert!(!limiter.check("a").await);
+        assert!(!limiter.check("b").await);
+    }
+
+    #[tokio::test]
+    async fn test_window_reset() {
+        let limiter = RateLimiter::new(RateLimitConfig {
+            max_requests: 1,
+            window: Duration::from_millis(50),
+        });
+        assert!(limiter.check("k").await);
+        assert!(!limiter.check("k").await);
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(limiter.check("k").await);
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_removes_expired() {
+        let limiter = RateLimiter::new(RateLimitConfig {
+            max_requests: 10,
+            window: Duration::from_millis(10),
+        });
+        limiter.check("x").await;
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        limiter.cleanup().await;
+        // After cleanup, entry should be gone; new check starts fresh
+        assert!(limiter.check("x").await);
+    }
+
+    #[test]
+    fn test_default_config() {
+        let cfg = RateLimitConfig::default();
+        assert_eq!(cfg.max_requests, 60);
+        assert_eq!(cfg.window, Duration::from_secs(60));
+    }
+}

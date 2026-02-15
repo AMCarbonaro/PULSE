@@ -222,3 +222,207 @@ pub struct Account {
     pub total_earned: f64,
     pub blocks_participated: u64,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_motion() -> Motion {
+        Motion { x: 0.3, y: 0.4, z: 0.0 }
+    }
+
+    fn sample_heartbeat() -> Heartbeat {
+        Heartbeat {
+            timestamp: 1700000000000,
+            heart_rate: 72,
+            motion: sample_motion(),
+            temperature: 36.6,
+            device_pubkey: "aabbccdd".to_string(),
+            signature: String::new(),
+        }
+    }
+
+    #[test]
+    fn test_motion_magnitude() {
+        let m = Motion { x: 3.0, y: 4.0, z: 0.0 };
+        assert!((m.magnitude() - 5.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_motion_magnitude_zero() {
+        let m = Motion { x: 0.0, y: 0.0, z: 0.0 };
+        assert_eq!(m.magnitude(), 0.0);
+    }
+
+    #[test]
+    fn test_heartbeat_serialization_roundtrip() {
+        let hb = sample_heartbeat();
+        let json = serde_json::to_string(&hb).unwrap();
+        let hb2: Heartbeat = serde_json::from_str(&json).unwrap();
+        assert_eq!(hb2.heart_rate, 72);
+        assert_eq!(hb2.timestamp, hb.timestamp);
+        assert!((hb2.temperature - 36.6).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_heartbeat_signable_bytes_deterministic() {
+        let hb = sample_heartbeat();
+        assert_eq!(hb.signable_bytes(), hb.signable_bytes());
+    }
+
+    #[test]
+    fn test_heartbeat_signable_bytes_excludes_signature() {
+        let mut hb = sample_heartbeat();
+        let bytes1 = hb.signable_bytes();
+        hb.signature = "deadbeef".to_string();
+        let bytes2 = hb.signable_bytes();
+        assert_eq!(bytes1, bytes2);
+    }
+
+    #[test]
+    fn test_heartbeat_weight_range() {
+        let hb = sample_heartbeat();
+        let w = hb.weight();
+        assert!(w > 0.0 && w <= 1.0, "weight out of range: {}", w);
+    }
+
+    #[test]
+    fn test_heartbeat_weight_with_continuity_zero() {
+        let hb = sample_heartbeat();
+        let w0 = hb.weight_with_continuity(0.0);
+        let w1 = hb.weight_with_continuity(1.0);
+        assert!(w1 > w0);
+    }
+
+    #[test]
+    fn test_transaction_serialization_roundtrip() {
+        let tx = Transaction {
+            tx_id: "tx1".to_string(),
+            sender_pubkey: "sender".to_string(),
+            recipient_pubkey: "recipient".to_string(),
+            amount: 42.5,
+            timestamp: 1700000000000,
+            heartbeat_signature: "sig".to_string(),
+            signature: String::new(),
+        };
+        let json = serde_json::to_string(&tx).unwrap();
+        let tx2: Transaction = serde_json::from_str(&json).unwrap();
+        assert_eq!(tx2.tx_id, "tx1");
+        assert!((tx2.amount - 42.5).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_transaction_signable_bytes_excludes_signature() {
+        let mut tx = Transaction {
+            tx_id: "tx1".to_string(),
+            sender_pubkey: "s".to_string(),
+            recipient_pubkey: "r".to_string(),
+            amount: 10.0,
+            timestamp: 100,
+            heartbeat_signature: "hs".to_string(),
+            signature: String::new(),
+        };
+        let b1 = tx.signable_bytes();
+        tx.signature = "changed".to_string();
+        assert_eq!(b1, tx.signable_bytes());
+    }
+
+    #[test]
+    fn test_block_compute_hash_deterministic() {
+        let block = PulseBlock {
+            index: 1,
+            timestamp: 12345,
+            previous_hash: "prev".to_string(),
+            heartbeats: vec![],
+            transactions: vec![],
+            n_live: 0,
+            total_weight: 0.0,
+            security: 0.0,
+            bio_entropy: "00".to_string(),
+            block_hash: String::new(),
+        };
+        assert_eq!(block.compute_hash(), block.compute_hash());
+        assert!(!block.compute_hash().is_empty());
+    }
+
+    #[test]
+    fn test_block_compute_hash_changes_with_data() {
+        let b1 = PulseBlock {
+            index: 1,
+            timestamp: 100,
+            previous_hash: "p".to_string(),
+            heartbeats: vec![],
+            transactions: vec![],
+            n_live: 0,
+            total_weight: 0.0,
+            security: 0.0,
+            bio_entropy: String::new(),
+            block_hash: String::new(),
+        };
+        let mut b2 = b1.clone();
+        b2.index = 2;
+        assert_ne!(b1.compute_hash(), b2.compute_hash());
+    }
+
+    #[test]
+    fn test_block_serialization_roundtrip() {
+        let block = PulseBlock {
+            index: 5,
+            timestamp: 9999,
+            previous_hash: "abc".to_string(),
+            heartbeats: vec![sample_heartbeat()],
+            transactions: vec![],
+            n_live: 1,
+            total_weight: 0.5,
+            security: 0.5,
+            bio_entropy: "ff".to_string(),
+            block_hash: "hash".to_string(),
+        };
+        let json = serde_json::to_string(&block).unwrap();
+        let b2: PulseBlock = serde_json::from_str(&json).unwrap();
+        assert_eq!(b2.index, 5);
+        assert_eq!(b2.heartbeats.len(), 1);
+    }
+
+    #[test]
+    fn test_fork_probability() {
+        let block = PulseBlock {
+            index: 1, timestamp: 0, previous_hash: String::new(),
+            heartbeats: vec![], transactions: vec![],
+            n_live: 5, total_weight: 3.0, security: 3.0,
+            bio_entropy: String::new(), block_hash: String::new(),
+        };
+        let p = block.fork_probability(0.5);
+        // e^(-0.5 * 3.0) ≈ 0.2231
+        assert!((p - 0.2231).abs() < 0.001);
+        // Higher security → lower fork probability
+        let block2 = PulseBlock { security: 10.0, ..block };
+        assert!(block2.fork_probability(0.5) < p);
+    }
+
+    #[test]
+    fn test_network_stats_default_fields() {
+        let stats = NetworkStats {
+            chain_length: 10,
+            total_minted: 1000.0,
+            active_accounts: 5,
+            current_tps: 2.0,
+            avg_block_time: 5.0,
+            total_security: 50.0,
+            current_block_reward: 100.0,
+            halving_epoch: 0,
+            cumulative_weight: 50.0,
+            inflation_rate: 0.1,
+        };
+        let json = serde_json::to_string(&stats).unwrap();
+        let s2: NetworkStats = serde_json::from_str(&json).unwrap();
+        assert_eq!(s2.chain_length, 10);
+    }
+
+    #[test]
+    fn test_account_default() {
+        let acc = Account::default();
+        assert_eq!(acc.balance, 0.0);
+        assert_eq!(acc.blocks_participated, 0);
+    }
+}
