@@ -9,7 +9,7 @@
 //! - `consensus` - Proof-of-Life consensus engine
 //! - `api` - HTTP API for device communication
 //! - `storage` - Persistent chain storage
-//! - `network` - P2P networking
+//! - `network` - P2P networking (channel-based architecture)
 
 pub mod types;
 pub mod crypto;

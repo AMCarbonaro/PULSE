@@ -21,6 +21,7 @@ use tower_http::cors::CorsLayer;
 use tracing::info;
 
 use crate::consensus::ProofOfLife;
+use crate::network::NetworkHandle;
 use crate::types::{Account, Heartbeat, Transaction};
 use rate_limit::{RateLimiter, RateLimitConfig};
 pub use websocket::WsBroadcaster;
@@ -33,10 +34,11 @@ pub type AppState = Arc<RwLock<ProofOfLife>>;
 #[derive(Clone)]
 pub struct ApiState {
     pub consensus: AppState,
-    pub pulse_limiter: RateLimiter,   // Strict: heartbeat submissions
-    pub query_limiter: RateLimiter,   // Lenient: read queries
+    pub pulse_limiter: RateLimiter,
+    pub query_limiter: RateLimiter,
     pub ws_broadcaster: Arc<WsBroadcaster>,
     pub event_log: EventLog,
+    pub network: NetworkHandle,
 }
 
 /// Node version info
@@ -71,23 +73,24 @@ impl ApiResponse<()> {
     }
 }
 
-/// Create the API router, returning the Router plus handles for the block loop.
-pub fn create_router(state: AppState) -> (Router, Arc<WsBroadcaster>, EventLog) {
+/// Create the API router
+pub fn create_router(state: AppState, network: NetworkHandle) -> (Router, Arc<WsBroadcaster>, EventLog) {
     let ws_broadcaster = Arc::new(WsBroadcaster::new(256));
     let event_log = EventLog::new();
     
     let api_state = ApiState {
         consensus: state,
         pulse_limiter: RateLimiter::new(RateLimitConfig {
-            max_requests: 30,                    // 30 heartbeats per minute per IP
+            max_requests: 30,
             window: Duration::from_secs(60),
         }),
         query_limiter: RateLimiter::new(RateLimitConfig {
-            max_requests: 120,                   // 120 queries per minute per IP
+            max_requests: 120,
             window: Duration::from_secs(60),
         }),
         ws_broadcaster: ws_broadcaster.clone(),
         event_log: event_log.clone(),
+        network,
     };
 
     // Spawn rate limiter cleanup task
@@ -102,13 +105,9 @@ pub fn create_router(state: AppState) -> (Router, Arc<WsBroadcaster>, EventLog) 
     });
 
     let router = Router::new()
-        // Health check
         .route("/health", get(health_check))
-        // Heartbeat submission
         .route("/pulse", post(submit_heartbeat))
-        // Transaction submission
         .route("/tx", post(submit_transaction))
-        // Query endpoints
         .route("/stats", get(get_stats))
         .route("/balance/{pubkey}", get(get_balance))
         .route("/accounts", get(get_accounts))
@@ -116,12 +115,10 @@ pub fn create_router(state: AppState) -> (Router, Arc<WsBroadcaster>, EventLog) 
         .route("/blocks", get(get_blocks))
         .route("/block/:index", get(get_block_by_index))
         .route("/chain", get(get_chain_info))
-        // Node info & activity
         .route("/info", get(get_node_info))
         .route("/events", get(get_events))
-        // WebSocket for live updates
+        .route("/peers", get(get_peers))
         .route("/ws", get(websocket::ws_handler).with_state(ws_broadcaster.clone()))
-        // Add CORS for device access
         .layer(CorsLayer::permissive())
         .with_state(api_state);
 
@@ -139,7 +136,6 @@ async fn submit_heartbeat(
     State(state): State<ApiState>,
     Json(heartbeat): Json<Heartbeat>,
 ) -> impl IntoResponse {
-    // Rate limit by IP
     let ip = addr.ip().to_string();
     if !state.pulse_limiter.check(&ip).await {
         return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({
@@ -148,7 +144,6 @@ async fn submit_heartbeat(
         })));
     }
 
-    // Input validation
     if heartbeat.device_pubkey.len() < 32 || heartbeat.device_pubkey.len() > 256 {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
             "success": false,
@@ -177,6 +172,13 @@ async fn submit_heartbeat(
         })));
     }
 
+    // Forward to P2P network
+    let hb_for_p2p = heartbeat.clone();
+    let net = state.network.clone();
+    tokio::spawn(async move {
+        net.broadcast_heartbeat(&hb_for_p2p).await;
+    });
+
     let mut pol = state.consensus.write().await;
     
     match pol.receive_heartbeat(heartbeat) {
@@ -197,7 +199,6 @@ async fn submit_transaction(
     State(state): State<ApiState>,
     Json(tx): Json<Transaction>,
 ) -> impl IntoResponse {
-    // Rate limit
     let ip = addr.ip().to_string();
     if !state.pulse_limiter.check(&ip).await {
         return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({
@@ -206,7 +207,6 @@ async fn submit_transaction(
         })));
     }
 
-    // Input validation
     if tx.amount <= 0.0 {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
             "success": false,
@@ -273,7 +273,6 @@ async fn get_balance(
         }))).into_response();
     }
 
-    // Validate pubkey format
     if pubkey.len() < 32 || pubkey.len() > 256 || !pubkey.chars().all(|c| c.is_ascii_hexdigit()) {
         return (StatusCode::BAD_REQUEST, Json(ApiResponse::<()>::err("Invalid public key format"))).into_response();
     }
@@ -290,7 +289,7 @@ async fn get_balance(
     Json(ApiResponse::ok(BalanceResponse { pubkey, balance })).into_response()
 }
 
-/// Get all accounts (network view)
+/// Get all accounts
 async fn get_accounts(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<ApiState>,
@@ -335,7 +334,7 @@ async fn get_latest_block(
     }
 }
 
-/// Get blocks with pagination (default: latest 50)
+/// Get blocks with pagination
 async fn get_blocks(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<ApiState>,
@@ -353,8 +352,7 @@ async fn get_blocks(
     let all_blocks = pol.get_blocks();
     let total = all_blocks.len() as u64;
     
-    // Default: latest 50 blocks
-    let limit = params.limit.unwrap_or(50).min(200); // cap at 200
+    let limit = params.limit.unwrap_or(50).min(200);
     let offset = params.offset.unwrap_or(total.saturating_sub(limit));
     
     let blocks: Vec<_> = all_blocks.into_iter()
@@ -432,7 +430,7 @@ async fn get_chain_info(
     Json(ApiResponse::ok(info)).into_response()
 }
 
-/// Get node info / version
+/// Get node info
 async fn get_node_info(
     State(state): State<ApiState>,
 ) -> impl IntoResponse {
@@ -445,7 +443,8 @@ async fn get_node_info(
         active_accounts: usize,
         heartbeat_pool_size: usize,
         ws_clients: usize,
-        uptime_info: String,
+        peer_id: String,
+        peer_count: usize,
     }
     
     Json(ApiResponse::ok(NodeInfo {
@@ -454,7 +453,28 @@ async fn get_node_info(
         active_accounts: pol.get_accounts().len(),
         heartbeat_pool_size: pol.heartbeat_pool_size(),
         ws_clients: state.ws_broadcaster.subscriber_count(),
-        uptime_info: "running".to_string(),
+        peer_id: state.network.info.peer_id.clone(),
+        peer_count: state.network.info.peer_count(),
+    })).into_response()
+}
+
+/// Get connected P2P peers (lock-free!)
+async fn get_peers(
+    State(state): State<ApiState>,
+) -> impl IntoResponse {
+    #[derive(Serialize)]
+    struct PeerInfo {
+        peer_id: String,
+        peer_count: usize,
+        connected_peers: Vec<String>,
+    }
+    
+    let peers = state.network.info.connected_peers().await;
+    
+    Json(ApiResponse::ok(PeerInfo {
+        peer_id: state.network.info.peer_id.clone(),
+        peer_count: peers.len(),
+        connected_peers: peers,
     })).into_response()
 }
 
@@ -465,7 +485,7 @@ pub struct EventParams {
     pub since: Option<u64>,
 }
 
-/// Get recent events (activity feed)
+/// Get recent events
 async fn get_events(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<ApiState>,
@@ -488,15 +508,19 @@ async fn get_events(
     Json(ApiResponse::ok(events)).into_response()
 }
 
-/// Return type for start_server — both broadcaster and event log
+/// Return type for start_server
 pub struct ServerHandles {
     pub broadcaster: Arc<WsBroadcaster>,
     pub event_log: EventLog,
 }
 
-/// Start the API server, returning handles for the block loop to use
-pub async fn start_server(state: AppState, addr: &str) -> anyhow::Result<ServerHandles> {
-    let (router, broadcaster, event_log) = create_router(state);
+/// Start the API server
+pub async fn start_server(
+    state: AppState,
+    addr: &str,
+    network: NetworkHandle,
+) -> anyhow::Result<ServerHandles> {
+    let (router, broadcaster, event_log) = create_router(state, network);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     
     info!("🌐 API server listening on {}", addr);
